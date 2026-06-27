@@ -2,7 +2,7 @@
 macro_rules! make_id {
     ($name:ident) => {
         #[derive(Hash, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-        pub struct $name(::uuid::Uuid);
+        pub struct $name(pub ::uuid::Uuid);
 
         impl $name {
             pub const fn from_u128(v: u128) -> Self {
