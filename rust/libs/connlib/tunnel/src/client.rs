@@ -39,8 +39,7 @@ use crate::{IPV4_TUNNEL, IPV6_TUNNEL, IpConfig, TunConfig, dns, p2p_control};
 use anyhow::{Context, ErrorExt, Result};
 use boringtun::x25519;
 use connlib_model::{
-    ClientId, ClientOrGatewayId, ConnectedDeviceView, GatewayId, IceCandidate, PublicKey, RelayId,
-    ResourceId, ResourceList, ResourceStatus, ResourceView,
+    ClientId, ClientOrGatewayId, ConnectedDeviceView, GatewayId, IceCandidate, PublicKey, RelayId, ResourceId, ResourceList, ResourceStatus, ResourceView, StaticSecret,
 };
 use connlib_model::{Site, SiteId};
 use dns_resource_nat::DnsResourceNat;
@@ -416,6 +415,10 @@ impl ClientState {
 
     pub(crate) fn public_key(&self) -> PublicKey {
         self.node.public_key()
+    }
+
+    pub(crate) fn private_key(&self) -> &StaticSecret {
+        self.node.private_key()
     }
 
     pub fn shut_down(&mut self, now: Instant) {

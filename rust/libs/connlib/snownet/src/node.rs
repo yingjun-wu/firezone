@@ -425,6 +425,10 @@ where
         self.public_key
     }
 
+    pub fn private_key(&self) -> &StaticSecret {
+        &self.private_key
+    }
+
     pub fn connection_id(&self, key: PublicKey, now: Instant) -> Option<TId> {
         self.connections.iter_established().find_map(|(id, c)| {
             (c.remote_pub_key == key && c.tunnel.time_since_last_handshake_at(now).is_some())

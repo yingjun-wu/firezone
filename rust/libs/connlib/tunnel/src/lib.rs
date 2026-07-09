@@ -10,7 +10,7 @@
 use crate::unroutable_packet::RoutingError;
 use anyhow::{Context as _, ErrorExt as _, Result};
 use connlib_model::{
-    ClientId, ClientOrGatewayId, GatewayId, IceCandidate, PublicKey, ResourceId, ResourceList,
+    ClientId, ClientOrGatewayId, GatewayId, IceCandidate, PublicKey, ResourceId, ResourceList, StaticSecret,
 };
 use dns_types::DomainName;
 use eventloop_budget::Budget;
@@ -148,6 +148,10 @@ impl ClientTunnel {
 
     pub fn public_key(&self) -> PublicKey {
         self.role_state.public_key()
+    }
+
+    pub fn private_key(&self) -> &StaticSecret {
+        self.role_state.private_key()
     }
 
     pub fn reset(&mut self, reason: &str) {
