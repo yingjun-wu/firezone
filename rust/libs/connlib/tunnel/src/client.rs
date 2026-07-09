@@ -2052,6 +2052,13 @@ impl ClientState {
         }
     }
 
+    pub fn get_site_by_gateway(&self, gid: &GatewayId) -> Option<SiteId> {
+        self.gateways_by_site
+            .iter()
+            .find(|(_, gateways)| gateways.contains(gid))
+            .map(|(sid, _)| sid.clone())
+    }
+
     fn update_site_status_by_gateway(
         &mut self,
         gid: &GatewayId,
