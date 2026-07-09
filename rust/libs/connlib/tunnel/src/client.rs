@@ -2059,6 +2059,14 @@ impl ClientState {
             .map(|(sid, _)| sid.clone())
     }
 
+    pub fn get_sites_by_gateways(&self, gids: &[GatewayId]) -> Vec<SiteId> {
+        self.gateways_by_site
+            .iter()
+            .filter(|(_, gateways)| gateways.iter().any(|gid| gids.contains(gid)))
+            .map(|(sid, _)| sid.clone())
+            .collect()
+    }
+
     fn update_site_status_by_gateway(
         &mut self,
         gid: &GatewayId,
