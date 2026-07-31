@@ -82,6 +82,7 @@ pub type ClientTunnel = Tunnel<ClientState>;
 pub use client::ClientState;
 pub use client::dns_config::DnsMapping;
 pub use dns::DnsResourceRecord;
+pub use client::resource;
 pub use gateway::{DnsResourceNatEntry, GatewayState, ResolveDnsRequest};
 pub use io::TunChannelClosed;
 pub use sockets::UdpSocketThreadStopped;
