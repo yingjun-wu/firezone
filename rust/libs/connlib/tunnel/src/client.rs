@@ -6,7 +6,7 @@ mod dns_resource_nat;
 mod gateway_on_client;
 mod pending_device_access;
 mod pending_flows;
-mod resource;
+pub mod resource;
 mod tracked_state;
 
 pub(crate) use crate::client::client_on_client::ClientOnClient;
