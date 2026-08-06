@@ -10,7 +10,8 @@
 use crate::unroutable_packet::RoutingError;
 use anyhow::{Context as _, ErrorExt as _, Result};
 use connlib_model::{
-    ClientId, ClientOrGatewayId, GatewayId, IceCandidate, PublicKey, ResourceId, ResourceList, StaticSecret,
+    ClientId, ClientOrGatewayId, GatewayId, IceCandidate, PublicKey, ResourceId, ResourceList,
+    StaticSecret,
 };
 use dns_types::DomainName;
 use eventloop_budget::Budget;
@@ -81,8 +82,8 @@ pub type ClientTunnel = Tunnel<ClientState>;
 
 pub use client::ClientState;
 pub use client::dns_config::DnsMapping;
-pub use dns::DnsResourceRecord;
 pub use client::resource;
+pub use dns::DnsResourceRecord;
 pub use gateway::{DnsResourceNatEntry, GatewayState, ResolveDnsRequest};
 pub use io::TunChannelClosed;
 pub use sockets::UdpSocketThreadStopped;
@@ -357,6 +358,10 @@ impl GatewayTunnel {
 
     pub fn public_key(&self) -> PublicKey {
         self.role_state.public_key()
+    }
+
+    pub fn private_key(&self) -> &StaticSecret {
+        self.role_state.private_key()
     }
 
     /// Shut down the Gateway tunnel.

@@ -92,6 +92,10 @@ impl GatewayState {
         self.node.public_key()
     }
 
+    pub(crate) fn private_key(&self) -> &x25519::StaticSecret {
+        self.node.private_key()
+    }
+
     pub fn shut_down(&mut self, now: Instant) {
         tracing::info!("Initiating graceful shutdown");
 
