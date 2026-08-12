@@ -452,6 +452,11 @@ impl Io {
         self.tun.set_tun(tun);
     }
 
+    /// Remove the current TUN handle (e.g. to wrap/unwrap a demux adapter).
+    pub fn take_tun(&mut self) -> Option<Box<dyn Tun>> {
+        self.tun.take_tun()
+    }
+
     pub fn send_tun(&mut self, packet: IpPacket) {
         self.packet_counter.add(
             1,

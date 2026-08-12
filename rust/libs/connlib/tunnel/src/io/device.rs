@@ -46,6 +46,11 @@ impl Device {
         }
     }
 
+    /// Remove the current TUN handle (e.g. to wrap/unwrap a demux adapter).
+    pub(crate) fn take_tun(&mut self) -> Option<Box<dyn Tun>> {
+        self.tun.take()
+    }
+
     pub(crate) fn poll_read_many(
         &mut self,
         cx: &mut Context<'_>,

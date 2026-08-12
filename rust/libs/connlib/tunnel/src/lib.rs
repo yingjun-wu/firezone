@@ -116,6 +116,11 @@ impl<TRoleState> Tunnel<TRoleState> {
         self.io.set_tun(tun);
     }
 
+    /// Remove the current TUN handle (e.g. to wrap/unwrap a demux adapter).
+    pub fn take_tun(&mut self) -> Option<Box<dyn Tun>> {
+        self.io.take_tun()
+    }
+
     pub fn rebind_dns(&mut self, sockets: Vec<SocketAddr>) -> Result<(), TunnelError> {
         self.io.rebind_dns(sockets)
     }
