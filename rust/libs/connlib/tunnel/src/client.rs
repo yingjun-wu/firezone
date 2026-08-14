@@ -1228,6 +1228,24 @@ impl ClientState {
         Some(*gid)
     }
 
+    /// Returns the Gateway's TUN IPs (`gateway_tun.{v4,v6}`) if that peer is present.
+    pub fn gateway_tun_by_id(&self, gateway: &GatewayId) -> Option<IpConfig> {
+        self.gateways
+            .peer_by_id(gateway)
+            .map(|g| g.gateway_tun())
+    }
+
+    /// Resource → GatewayId + Gateway TUN IPs (when the Gateway peer is connected).
+    pub fn gateway_tun_by_resource(
+        &self,
+        resource: &ResourceId,
+    ) -> Option<(GatewayId, IpConfig)> {
+        let gateway = self.gateway_by_resource(resource)?;
+        let tun = self.gateway_tun_by_id(&gateway)?;
+
+        Some((gateway, tun))
+    }
+
     fn initialise_tcp_dns_client(&mut self) {
         let Some(tun_config) = self.tun_config.current() else {
             return;
