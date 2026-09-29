@@ -25,7 +25,11 @@
 use std::{
     collections::BinaryHeap,
     path::{Path, PathBuf},
-    sync::{Arc, mpsc},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -41,9 +45,15 @@ use socket_factory::{SocketFactory, TcpSocket};
 
 mod ingest;
 
-use ingest::{IngestClient, body_string, ingest_endpoint, retry_after};
+use ingest::{IngestClient, ingest_endpoint, retry_after};
 
 /// Default flows per upload when the portal doesn't specify one.
+static FAILED_UPLOADS: AtomicU64 = AtomicU64::new(0);
+/// Process-wide connection/request failures and rejected HTTP responses, excluding redirects and rate limits.
+pub fn failed_uploads() -> u64 {
+    FAILED_UPLOADS.load(Ordering::Relaxed)
+}
+
 const DEFAULT_BATCH_SIZE: usize = 1_000;
 /// Hard ceiling on flows per upload (the portal's per-request limit).
 const MAX_BATCH_SIZE: usize = 10_000;
@@ -482,6 +492,7 @@ async fn upload_pending(
     let mut client = match IngestClient::connect(url, socket_factory).await {
         Ok(client) => client,
         Err(e) => {
+            FAILED_UPLOADS.fetch_add(1, Ordering::Relaxed);
             tracing::info!("Failed to open flow-log ingest connection: {e:#}");
             return Ok(false);
         }
@@ -719,6 +730,7 @@ async fn submit(client: &mut IngestClient, token: &str, batch: &[Pending]) -> Re
         let response = match client.send(token, body.clone()).await {
             Ok(response) => response,
             Err(e) => {
+                FAILED_UPLOADS.fetch_add(1, Ordering::Relaxed);
                 tracing::info!("Flow-log upload request failed: {e:#}");
                 // A closed connection won't recover by retrying; defer to the next pass.
                 if client.is_closed() || !sleep_backoff(&mut backoff).await {
@@ -745,6 +757,7 @@ async fn submit(client: &mut IngestClient, token: &str, batch: &[Pending]) -> Re
                 // Not a failure; keep retrying the same batch without spending the budget.
             }
             ResponseAction::Retry => {
+                FAILED_UPLOADS.fetch_add(1, Ordering::Relaxed);
                 tracing::info!(%status, "Flow-log upload transient failure; backing off");
                 if !sleep_backoff(&mut backoff).await {
                     return Ok(BatchOutcome::Spooled);
@@ -752,8 +765,9 @@ async fn submit(client: &mut IngestClient, token: &str, batch: &[Pending]) -> Re
             }
             ResponseAction::Redirect => client.follow_redirect(&response).await?,
             ResponseAction::Defer => {
-                let body = body_string(&response);
-                tracing::info!(%status, %body, "Flow-log upload rejected; keeping the batch");
+                FAILED_UPLOADS.fetch_add(1, Ordering::Relaxed);
+                // Error bodies are untrusted and may echo credentials or payloads.
+                tracing::info!(%status, "Flow-log upload rejected; keeping the batch");
                 return Ok(BatchOutcome::Spooled);
             }
         }

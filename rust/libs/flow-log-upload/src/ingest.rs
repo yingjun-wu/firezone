@@ -102,10 +102,6 @@ pub fn retry_after(response: &http::Response<Bytes>) -> Option<Duration> {
     Some(Duration::from_secs(seconds))
 }
 
-pub fn body_string(response: &http::Response<Bytes>) -> String {
-    String::from_utf8_lossy(response.body()).into_owned()
-}
-
 /// Opens a tunnel-bypassing HTTP client to the ingest host, re-resolved on every
 /// connect so address changes are picked up.
 ///

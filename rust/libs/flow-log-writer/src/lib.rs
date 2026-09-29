@@ -84,6 +84,12 @@ use tracing_subscriber::registry::LookupSpan;
 /// faster than the per-report fsync can drain them. Mobile gets a smaller buffer;
 /// it has less memory headroom and the OS may kill the tunnel process under
 /// memory pressure.
+static DROPPED_REPORTS: AtomicU64 = AtomicU64::new(0);
+/// Process-wide reports lost to queue pressure, disk limits or persistence failure.
+pub fn dropped_reports() -> u64 {
+    DROPPED_REPORTS.load(Ordering::Relaxed)
+}
+
 const CHANNEL_CAPACITY: usize = if cfg!(any(target_os = "ios", target_os = "android")) {
     1_000
 } else {
@@ -314,6 +320,7 @@ where
         match self.tx.try_send(Command::Write(report)) {
             Ok(()) => {}
             Err(mpsc::TrySendError::Full(_)) => {
+                DROPPED_REPORTS.fetch_add(1, Ordering::Relaxed);
                 let dropped = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
 
                 if dropped == 1 || dropped.is_multiple_of(1_000) {
@@ -321,6 +328,7 @@ where
                 }
             }
             Err(mpsc::TrySendError::Disconnected(_)) => {
+                DROPPED_REPORTS.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!("Flow-log writer thread is gone; dropping report");
             }
         }
@@ -514,8 +522,13 @@ impl Spool {
 
         match write_report(&self.root, report) {
             Outcome::Written { bytes } => self.spooled += clusters_for(bytes, self.cluster),
-            Outcome::DiskFull => self.disk_full_until = Some(now + DISK_FULL_COOLDOWN),
-            Outcome::Skipped => {}
+            Outcome::DiskFull => {
+                DROPPED_REPORTS.fetch_add(1, Ordering::Relaxed);
+                self.disk_full_until = Some(now + DISK_FULL_COOLDOWN);
+            }
+            Outcome::Skipped => {
+                DROPPED_REPORTS.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -534,6 +547,7 @@ impl Spool {
 
     fn drop_report(&mut self, reason: &'static str) {
         self.dropped += 1;
+        DROPPED_REPORTS.fetch_add(1, Ordering::Relaxed);
 
         if self.dropped == 1 || self.dropped.is_multiple_of(1_000) {
             tracing::debug!(
