@@ -707,7 +707,7 @@ impl ClientState {
                 };
 
                 flow_tracker::record_peer(authorization.gateway_id, flow_tracker::Role::Initiator);
-                flow_tracker::record_ingest_token(Some(authorization.ingest_token.clone()));
+                flow_tracker::record_ingest_token(authorization.ingest_token.clone());
 
                 let packet = if let Some(domain) = &route.domain {
                     flow_tracker::record_domain(domain.clone());
@@ -1027,6 +1027,7 @@ impl ClientState {
     }
 
     #[tracing::instrument(level = "debug", skip_all, fields(%rid))]
+    /// `None` disables flow-log attribution for control planes without an ingest service.
     pub fn handle_resource_access_authorized(
         &mut self,
         rid: ResourceId,
@@ -1038,7 +1039,7 @@ impl ClientState {
         client_ice: IceCredentials,
         gateway_ice: IceCredentials,
         use_iceless: bool,
-        flow_logs_ingest_token: IngestToken,
+        flow_logs_ingest_token: impl Into<Option<IngestToken>>,
         now: Instant,
     ) -> anyhow::Result<Result<(), NoTurnServers>> {
         tracing::debug!(%gid, "New resource access authorized");
@@ -2749,7 +2750,7 @@ struct OutboundAuthorizations {
 
 struct GatewayAuthorization {
     gateway_id: GatewayId,
-    ingest_token: IngestToken,
+    ingest_token: Option<IngestToken>,
 }
 
 impl OutboundAuthorizations {
@@ -2757,13 +2758,13 @@ impl OutboundAuthorizations {
         &mut self,
         resource_id: ResourceId,
         gateway_id: GatewayId,
-        ingest_token: IngestToken,
+        ingest_token: impl Into<Option<IngestToken>>,
     ) {
         self.gateways.insert(
             resource_id,
             GatewayAuthorization {
                 gateway_id,
-                ingest_token,
+                ingest_token: ingest_token.into(),
             },
         );
     }
@@ -3191,8 +3192,9 @@ mod tests {
         assert!(state.get_sites_by_gateways(&[]).is_empty());
     }
 
-    #[test]
-    fn gateway_tun_lookup_requires_authorization_and_a_present_peer() {
+    #[test_case::test_case(None; "without_flow_logs")]
+    #[test_case::test_case(Some(test_ingest_token()); "with_flow_logs")]
+    fn gateway_tun_lookup_requires_authorization_and_a_present_peer(token: Option<IngestToken>) {
         let mut state = ClientState::for_test();
         let resource = ResourceId::from_u128(1);
         let gateway = GatewayId::from_u128(10);
@@ -3205,7 +3207,7 @@ mod tests {
         assert_eq!(state.gateway_tun_by_resource(&resource), None);
         state
             .outbound_authorizations
-            .authorize_gateway(resource, gateway, test_ingest_token());
+            .authorize_gateway(resource, gateway, token);
         assert_eq!(
             state.gateway_tun_by_resource(&resource),
             Some((gateway, tun))

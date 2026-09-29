@@ -209,8 +209,19 @@ impl ClientOnGateway {
     }
 
     /// Records the portal's per-flow ingest token for an authorized resource.
-    pub(crate) fn set_ingest_token(&mut self, rid: ResourceId, token: IngestToken) {
-        self.ingest_tokens.insert(rid, token);
+    pub(crate) fn set_ingest_token(
+        &mut self,
+        rid: ResourceId,
+        token: impl Into<Option<IngestToken>>,
+    ) {
+        match token.into() {
+            Some(token) => {
+                self.ingest_tokens.insert(rid, token);
+            }
+            None => {
+                self.ingest_tokens.remove(&rid);
+            }
+        }
     }
 
     // Note: we only allow updating filters and names
@@ -768,6 +779,22 @@ mod tests {
         messages::{Filter, PortRange, gateway::ResourceDescriptionCidr},
         unroutable_packet::RoutingError,
     };
+
+    #[test]
+    fn disabling_flow_log_attribution_removes_old_token_but_keeps_authorization() {
+        let mut peer = ClientOnGateway::new(client_id(), client_tun(), gateway_tun());
+        let resource = bar_cidr_resource();
+        let id = resource.id();
+        peer.add_resource(resource, None, Instant::now());
+        let token: IngestToken =
+            serde_json::from_value(serde_json::json!(flow_tracker::TEST_INGEST_TOKEN)).unwrap();
+        peer.set_ingest_token(id, token);
+        assert!(peer.ingest_tokens.contains_key(&id));
+
+        peer.set_ingest_token(id, None);
+        assert!(!peer.ingest_tokens.contains_key(&id));
+        assert!(peer.resources.contains_key(&id));
+    }
 
     #[test]
     fn gateway_filters_expire_individually() {

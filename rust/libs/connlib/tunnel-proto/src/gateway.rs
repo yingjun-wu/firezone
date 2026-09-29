@@ -309,6 +309,7 @@ impl GatewayState {
     }
 
     #[tracing::instrument(level = "debug", skip_all, fields(cid = %client.id))]
+    /// `None` disables flow-log attribution for control planes without an ingest service.
     pub fn create_authorization(
         &mut self,
         client: Client,
@@ -318,7 +319,7 @@ impl GatewayState {
         resource: ResourceDescription,
         use_iceless: bool,
         now: Instant,
-        flow_logs_ingest_token: IngestToken,
+        flow_logs_ingest_token: impl Into<Option<IngestToken>>,
     ) -> Result<(), NoTurnServers> {
         self.node.upsert_connection(
             client.id,
@@ -353,11 +354,12 @@ impl GatewayState {
         Ok(())
     }
 
+    /// `None` disables flow-log attribution for control planes without an ingest service.
     pub fn allow_access(
         &mut self,
         client: ClientId,
         client_tun: IpConfig,
-        flow_logs_ingest_token: IngestToken,
+        flow_logs_ingest_token: impl Into<Option<IngestToken>>,
         expires_at: Option<Duration>,
         resource: ResourceDescription,
         dns_resource_nat: Option<DnsResourceNatEntry>,
