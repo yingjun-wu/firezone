@@ -30,6 +30,55 @@ defmodule PortalWeb.Settings.AccountTest do
     end
   end
 
+  describe "limits banner" do
+    for {flags, message} <- [
+          {%{users_limit_exceeded: true}, "users."},
+          {%{users_limit_exceeded: true, seats_limit_exceeded: true},
+           "users, monthly active users."}
+        ] do
+      test "renders a complete warning for #{message}", %{
+        conn: conn,
+        account: account,
+        actor: actor
+      } do
+        account =
+          update_account(
+            account,
+            Map.put(unquote(Macro.escape(flags)), :metadata, %{
+              stripe: %{customer_id: "cus_test", product_name: "Enterprise"}
+            })
+          )
+
+        {:ok, _lv, html} =
+          conn
+          |> authorize_conn(actor)
+          |> live(~p"/#{account}/settings/account")
+
+        alerts = html |> Floki.parse_document!() |> Floki.find("[role=alert]")
+        text = alerts |> Floki.text() |> String.replace(~r/\s+/, " ")
+
+        assert text =~ "Your account has exceeded the following limits: #{unquote(message)}"
+        assert text =~ "Please check your billing information to continue using Firezone."
+
+        assert Floki.find(alerts, "a[href='/#{account.slug}/settings/account']") != []
+      end
+    end
+
+    test "does not show a warning when no limits are exceeded", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/account")
+
+      refute html =~ "Your account has exceeded the following limits:"
+      refute html =~ "check your billing information"
+    end
+  end
+
   describe "billing plan UI" do
     test "shows manage plan button for non-enterprise provisioned account", %{
       conn: conn,
@@ -105,6 +154,8 @@ defmodule PortalWeb.Settings.AccountTest do
         |> live(~p"/#{account}/settings/account")
 
       assert html =~ "Plan Features"
+      assert html =~ "Device Posture"
+      refute html =~ "ICE-less"
     end
 
     test "renders usage section", %{conn: conn, account: account, actor: actor} do
@@ -150,7 +201,7 @@ defmodule PortalWeb.Settings.AccountTest do
         |> form("form[phx-submit='submit_account_name']", %{account: %{name: "ab"}})
         |> render_change()
 
-      assert html =~ "should be at least 3 character(s)"
+      assert html =~ "too short"
     end
 
     test "saves updated account name", %{conn: conn, account: account, actor: actor} do
@@ -225,7 +276,7 @@ defmodule PortalWeb.Settings.AccountTest do
       account = fetch_account!(account.id)
 
       assert html =~ "Cancel deletion"
-      assert account.disabled_at
+      assert account.is_disabled
       assert account.scheduled_deletion_at
 
       queued_emails = collect_queued_emails(account.id)
@@ -244,6 +295,118 @@ defmodule PortalWeb.Settings.AccountTest do
       assert email.text_body =~ Calendar.strftime(account.scheduled_deletion_at, "%B %-d, %Y")
     end
 
+    test "prompts for feedback after scheduling deletion", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/account")
+
+      render_click(lv, "confirm_delete_account")
+      render_click(lv, "update_slug_confirmation", %{"slug_confirmation" => account.slug})
+
+      html =
+        lv
+        |> form("form[phx-submit='delete_account']", %{slug_confirmation: account.slug})
+        |> render_submit()
+
+      assert html =~ "Sorry Firezone didn&#39;t work out"
+      assert html =~ "Anything you&#39;d like to share about your experience?"
+
+      html =
+        lv
+        |> form("#deletion-feedback-form", %{
+          account: %{metadata: %{deletion_feedback: "  Too hard to set up  "}}
+        })
+        |> render_submit()
+
+      refute html =~ "Sorry Firezone didn&#39;t work out"
+      assert fetch_account!(account.id).metadata.deletion_feedback == "Too hard to set up"
+    end
+
+    test "skipping the feedback prompt stores nothing", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/account")
+
+      render_click(lv, "confirm_delete_account")
+      render_click(lv, "update_slug_confirmation", %{"slug_confirmation" => account.slug})
+
+      lv
+      |> form("form[phx-submit='delete_account']", %{slug_confirmation: account.slug})
+      |> render_submit()
+
+      html = render_click(lv, "skip_deletion_feedback")
+
+      refute html =~ "Sorry Firezone didn&#39;t work out"
+      refute fetch_account!(account.id).metadata.deletion_feedback
+    end
+
+    test "submitting empty feedback closes the prompt without storing", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/account")
+
+      render_click(lv, "confirm_delete_account")
+      render_click(lv, "update_slug_confirmation", %{"slug_confirmation" => account.slug})
+
+      lv
+      |> form("form[phx-submit='delete_account']", %{slug_confirmation: account.slug})
+      |> render_submit()
+
+      html =
+        lv
+        |> form("#deletion-feedback-form", %{
+          account: %{metadata: %{deletion_feedback: "   "}}
+        })
+        |> render_submit()
+
+      refute html =~ "Sorry Firezone didn&#39;t work out"
+      refute fetch_account!(account.id).metadata.deletion_feedback
+    end
+
+    test "shows an error when feedback is longer than 2000 characters", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/account")
+
+      render_click(lv, "confirm_delete_account")
+      render_click(lv, "update_slug_confirmation", %{"slug_confirmation" => account.slug})
+
+      lv
+      |> form("form[phx-submit='delete_account']", %{slug_confirmation: account.slug})
+      |> render_submit()
+
+      html =
+        lv
+        |> form("#deletion-feedback-form", %{
+          account: %{metadata: %{deletion_feedback: String.duplicate("a", 2001)}}
+        })
+        |> render_submit()
+
+      assert html =~ "Sorry Firezone didn&#39;t work out"
+      assert html =~ "should be at most 2000 character(s)"
+      refute fetch_account!(account.id).metadata.deletion_feedback
+    end
+
     test "sends aborted deletion email when cancellation restores the account", %{
       conn: conn,
       account: account,
@@ -253,7 +416,7 @@ defmodule PortalWeb.Settings.AccountTest do
 
       account =
         update_account(account,
-          disabled_at: DateTime.utc_now() |> DateTime.truncate(:second),
+          is_disabled: true,
           scheduled_deletion_at: scheduled_deletion_at
         )
 
@@ -273,7 +436,7 @@ defmodule PortalWeb.Settings.AccountTest do
       [scheduled_job] =
         jobs_for_worker_and_arg("Portal.Workers.DeleteAccount", "account_id", account.id)
 
-      refute account.disabled_at
+      refute account.is_disabled
       refute account.scheduled_deletion_at
       refute html =~ "scheduled for deletion"
       assert scheduled_job.state == "cancelled"
@@ -289,11 +452,11 @@ defmodule PortalWeb.Settings.AccountTest do
 
     test "scheduling is idempotent and only queues one email", %{account: account, actor: actor} do
       subject = subject_fixture(account: account, actor: actor)
-      disabled_at = DateTime.utc_now() |> DateTime.truncate(:second)
-      scheduled_deletion_at = DateTime.add(disabled_at, 7, :day)
+      now = DateTime.utc_now() |> DateTime.truncate(:second)
+      scheduled_deletion_at = DateTime.add(now, 7, :day)
 
       attrs = %{
-        disabled_at: disabled_at,
+        is_disabled: true,
         scheduled_deletion_at: scheduled_deletion_at
       }
 
@@ -304,7 +467,7 @@ defmodule PortalWeb.Settings.AccountTest do
                Deletion.schedule_account_deletion(
                  account,
                  %{
-                   disabled_at: DateTime.add(disabled_at, 1, :day),
+                   is_disabled: true,
                    scheduled_deletion_at: DateTime.add(scheduled_deletion_at, 1, :day)
                  },
                  subject
@@ -318,18 +481,18 @@ defmodule PortalWeb.Settings.AccountTest do
     test "scheduling requires account update permission", %{account: account} do
       actor = actor_fixture(account: account, type: :account_user)
       subject = subject_fixture(account: account, actor: actor)
-      disabled_at = DateTime.utc_now() |> DateTime.truncate(:second)
+      now = DateTime.utc_now() |> DateTime.truncate(:second)
 
       attrs = %{
-        disabled_at: disabled_at,
-        scheduled_deletion_at: DateTime.add(disabled_at, 7, :day)
+        is_disabled: true,
+        scheduled_deletion_at: DateTime.add(now, 7, :day)
       }
 
       assert {:error, :unauthorized} =
                Deletion.schedule_account_deletion(account, attrs, subject)
 
       account = fetch_account!(account.id)
-      refute account.disabled_at
+      refute account.is_disabled
       refute account.scheduled_deletion_at
       assert jobs_for_worker_and_arg("Portal.Workers.DeleteAccount", "account_id", account.id) == []
       assert collect_queued_emails(account.id) == []
@@ -339,30 +502,30 @@ defmodule PortalWeb.Settings.AccountTest do
       other_account = account_fixture()
       other_actor = admin_actor_fixture(account: other_account)
       subject = subject_fixture(account: other_account, actor: other_actor)
-      disabled_at = DateTime.utc_now() |> DateTime.truncate(:second)
+      now = DateTime.utc_now() |> DateTime.truncate(:second)
 
       attrs = %{
-        disabled_at: disabled_at,
-        scheduled_deletion_at: DateTime.add(disabled_at, 7, :day)
+        is_disabled: true,
+        scheduled_deletion_at: DateTime.add(now, 7, :day)
       }
 
       assert {:error, :unauthorized} =
                Deletion.schedule_account_deletion(account, attrs, subject)
 
       account = fetch_account!(account.id)
-      refute account.disabled_at
+      refute account.is_disabled
       refute account.scheduled_deletion_at
       assert jobs_for_worker_and_arg("Portal.Workers.DeleteAccount", "account_id", account.id) == []
       assert collect_queued_emails(account.id) == []
     end
 
     test "cancellation is idempotent and only queues one email", %{account: account, actor: actor} do
-      disabled_at = DateTime.utc_now() |> DateTime.truncate(:second)
-      scheduled_deletion_at = DateTime.add(disabled_at, 7, :day)
+      now = DateTime.utc_now() |> DateTime.truncate(:second)
+      scheduled_deletion_at = DateTime.add(now, 7, :day)
 
       account =
         update_account(account,
-          disabled_at: disabled_at,
+          is_disabled: true,
           scheduled_deletion_at: scheduled_deletion_at
         )
 
@@ -390,12 +553,12 @@ defmodule PortalWeb.Settings.AccountTest do
 
     test "cancellation requires account update permission", %{account: account} do
       actor = actor_fixture(account: account, type: :account_user)
-      disabled_at = DateTime.utc_now() |> DateTime.truncate(:second)
-      scheduled_deletion_at = DateTime.add(disabled_at, 7, :day)
+      now = DateTime.utc_now() |> DateTime.truncate(:second)
+      scheduled_deletion_at = DateTime.add(now, 7, :day)
 
       account =
         update_account(account,
-          disabled_at: disabled_at,
+          is_disabled: true,
           scheduled_deletion_at: scheduled_deletion_at
         )
 
@@ -410,7 +573,7 @@ defmodule PortalWeb.Settings.AccountTest do
                Deletion.cancel_account_deletion(account, subject)
 
       account = fetch_account!(account.id)
-      assert account.disabled_at
+      assert account.is_disabled
       assert account.scheduled_deletion_at
 
       [scheduled_job] =
@@ -424,12 +587,12 @@ defmodule PortalWeb.Settings.AccountTest do
       other_account = account_fixture()
       other_actor = admin_actor_fixture(account: other_account)
       subject = subject_fixture(account: other_account, actor: other_actor)
-      disabled_at = DateTime.utc_now() |> DateTime.truncate(:second)
-      scheduled_deletion_at = DateTime.add(disabled_at, 7, :day)
+      now = DateTime.utc_now() |> DateTime.truncate(:second)
+      scheduled_deletion_at = DateTime.add(now, 7, :day)
 
       account =
         update_account(account,
-          disabled_at: disabled_at,
+          is_disabled: true,
           scheduled_deletion_at: scheduled_deletion_at
         )
 
@@ -442,7 +605,7 @@ defmodule PortalWeb.Settings.AccountTest do
                Deletion.cancel_account_deletion(account, subject)
 
       account = fetch_account!(account.id)
-      assert account.disabled_at
+      assert account.is_disabled
       assert account.scheduled_deletion_at
 
       [scheduled_job] =

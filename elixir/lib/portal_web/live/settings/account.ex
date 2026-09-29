@@ -7,17 +7,19 @@ defmodule PortalWeb.Settings.Account do
   alias __MODULE__.Database
   require Logger
 
-  def mount(_params, _session, socket) do
+  def mount(_params, session, socket) do
     account = socket.assigns.account
     subject = socket.assigns.subject
     socket =
       assign(socket,
+        marketing_attribution: get_in(PortalWeb.WebsiteAttribution.fetch(session) || %{}, ["marketing"]),
         page_title: "Account",
         billing_provisioned: Billing.account_provisioned?(account),
         billing_plan_type: Billing.plan_type(account),
         error: nil,
         slug_confirmation: "",
         confirm_delete_account: false,
+        deletion_feedback_form: nil,
         edit_account_open: false,
         name_form: to_form(Database.change_account_name(account)),
         admins_count: Database.count_account_admin_users_for_account(subject),
@@ -33,13 +35,16 @@ defmodule PortalWeb.Settings.Account do
   def render(assigns) do
     ~H"""
     <div class="flex flex-col h-full relative">
-      <.settings_nav account={@account} current_path={@current_path}>
+      <Navigation.settings_nav
+        account={@account}
+        current_path={@current_path}
+      >
         <:actions>
-          <.button phx-click="open_edit_account" size="xs">
-            <.icon name="ri-pencil-line" class="w-3 h-3" /> Edit
-          </.button>
+          <Form.button phx-click="open_edit_account" size="xs">
+            <Core.icon name="ri-pencil-line" class="w-3 h-3" /> Edit
+          </Form.button>
         </:actions>
-      </.settings_nav>
+      </Navigation.settings_nav>
 
       <%!-- Two-column body --%>
       <div class="flex flex-1 bg-surface overflow-hidden">
@@ -60,11 +65,11 @@ defmodule PortalWeb.Settings.Account do
               class="space-y-1.5 pt-2 border-t border-border"
             >
               <dt class="text-[10px] text-subtle">Billing Email</dt>
-              <dd class="text-xs text-heading">
+              <dd class="text-xs text-body font-medium">
                 {@account.metadata.stripe.billing_email}
               </dd>
               <dt class="text-[10px] text-subtle mt-4">Support Type</dt>
-              <dd class="text-xs text-heading capitalize">
+              <dd class="text-xs text-body capitalize font-medium">
                 {billing_support_label(@account.metadata.stripe.support_type)}
               </dd>
             </dl>
@@ -79,9 +84,9 @@ defmodule PortalWeb.Settings.Account do
               class="pt-2 border-t border-border"
             >
               <div class="rounded-lg border border-violet-200 bg-violet-50 dark:border-violet-800 dark:bg-violet-950/30 p-3 flex gap-2.5 items-start">
-                <.icon
+                <Core.icon
                   name="ri-customer-service-2-line"
-                  class="w-4 h-4 shrink-0 text-violet-500 dark:text-violet-400 mt-0.5"
+                  class="w-4 h-4 shrink-0 text-link mt-0.5"
                 />
                 <div>
                   <p class="text-xs font-medium text-violet-700 dark:text-violet-300">
@@ -93,14 +98,14 @@ defmodule PortalWeb.Settings.Account do
                 </div>
               </div>
             </div>
-            <.button
+            <Form.button
               :if={@billing_provisioned and @billing_plan_type != :enterprise}
               phx-click="redirect_to_billing_portal"
               size="xs"
               class="w-full mt-1"
             >
               Manage plan
-            </.button>
+            </Form.button>
           </div>
 
           <%!-- Plan features (always shown) --%>
@@ -112,15 +117,6 @@ defmodule PortalWeb.Settings.Account do
               label="Identity Provider Sync"
               enabled={feature_enabled?(@account, :idp_sync)}
             />
-            <.feature_row label="REST API" enabled={feature_enabled?(@account, :rest_api)} />
-            <.feature_row
-              label="Traffic Filters"
-              enabled={feature_enabled?(@account, :traffic_filters)}
-            />
-            <.feature_row
-              label="Client-to-Client"
-              enabled={feature_enabled?(@account, :client_to_client)}
-            />
             <.feature_row
               label="Internet Resource"
               enabled={feature_enabled?(@account, :internet_resource)}
@@ -128,6 +124,11 @@ defmodule PortalWeb.Settings.Account do
             <.feature_row
               label="Policy Conditions"
               enabled={feature_enabled?(@account, :policy_conditions)}
+            />
+            <.feature_row label="Log Sinks" enabled={feature_enabled?(@account, :log_sinks)} />
+            <.feature_row
+              label="Device Posture"
+              enabled={feature_enabled?(@account, :device_posture)}
             />
           </div>
 
@@ -145,22 +146,54 @@ defmodule PortalWeb.Settings.Account do
             </p>
             <div
               :if={Portal.Billing.paid_plan?(@account)}
-              class="mb-3 px-3 py-2 rounded border border-amber-200 bg-amber-50 text-xs text-amber-800"
+              class="mb-3 px-3 py-2 rounded border border-warning/30 bg-warning-light text-xs text-warning"
             >
               You are on a paid plan. Any remaining time left on your subscription will be lost when the account is deleted.
             </div>
-            <.button type="button" phx-click="cancel_account_deletion" size="xs" class="w-full">
+            <Form.button type="button" phx-click="cancel_account_deletion" size="xs" class="w-full">
               Cancel deletion
-            </.button>
-            <.flash :if={@error} kind={:error} class="mt-2">
+            </Form.button>
+            <Core.flash :if={@error} kind={:error} class="mt-2">
               {@error}
-            </.flash>
+            </Core.flash>
           </div>
+
+          <Form.modal
+            :if={@deletion_feedback_form}
+            id="deletion-feedback-modal"
+            on_close="skip_deletion_feedback"
+            on_cancel="skip_deletion_feedback"
+          >
+            <:title>Sorry Firezone didn't work out</:title>
+            <:body>
+              <p class="mb-4">Anything you'd like to share about your experience?</p>
+              <.form
+                id="deletion-feedback-form"
+                for={@deletion_feedback_form}
+                phx-change="validate_deletion_feedback"
+                phx-submit="submit_deletion_feedback"
+              >
+                <.inputs_for :let={metadata} field={@deletion_feedback_form[:metadata]}>
+                  <Form.input
+                    field={metadata[:deletion_feedback]}
+                    type="textarea"
+                    placeholder="Your feedback (optional)"
+                    maxlength={Portal.Account.Metadata.deletion_feedback_max_length()}
+                    phx-debounce="300"
+                  />
+                </.inputs_for>
+              </.form>
+            </:body>
+            <:cancel_button>Skip</:cancel_button>
+            <:confirm_button form="deletion-feedback-form" type="submit">
+              Send feedback
+            </:confirm_button>
+          </Form.modal>
 
           <%!-- Danger Zone (active, unlocked accounts only) --%>
           <div :if={Account.active?(@account) and not Account.locked?(@account)} class="mt-6">
             <div class="border-t border-border mb-4"></div>
-            <h3 class="text-[10px] font-semibold tracking-widest uppercase text-error/60 mb-3">
+            <h3 class="text-[10px] font-semibold tracking-widest uppercase text-error mb-3">
               Danger Zone
             </h3>
 
@@ -170,7 +203,7 @@ defmodule PortalWeb.Settings.Account do
               phx-click="confirm_delete_account"
               class="w-full flex items-center gap-2 px-3 py-2 rounded border border-error/20 text-xs text-error hover:bg-error-light transition-colors"
             >
-              <.icon name="ri-delete-bin-line" class="w-4 h-4 shrink-0" /> Delete account
+              <Core.icon name="ri-delete-bin-line" class="w-4 h-4 shrink-0" /> Delete account
             </button>
 
             <div
@@ -188,32 +221,32 @@ defmodule PortalWeb.Settings.Account do
               <p class="text-xs text-error/70 mb-1.5">
                 Type <strong>{@account.slug}</strong> to confirm:
               </p>
-              <form phx-change="update_slug_confirmation" phx-submit="delete_account">
+              <form id="delete-account-form" phx-change="update_slug_confirmation" phx-submit="delete_account">
                 <input
                   type="text"
                   name="slug_confirmation"
                   value={@slug_confirmation}
                   placeholder={@account.slug}
                   autocomplete="off"
-                  class="w-full mb-2.5 rounded border border-error/30 bg-surface px-2 py-1.5 text-xs text-heading placeholder:text-muted focus:outline-none focus:ring-1 focus:ring-error/40"
+                  class="w-full mb-2.5 rounded border border-error/30 bg-surface px-2 py-1.5 text-xs text-heading placeholder:text-subtle focus:outline-none focus:ring-1 focus:ring-error/40"
                 />
                 <div class="flex items-center gap-1.5">
-                  <.button type="button" phx-click="cancel_delete_account" size="xs">
+                  <Form.button type="button" phx-click="cancel_delete_account" size="xs">
                     Cancel
-                  </.button>
-                  <.button
+                  </Form.button>
+                  <Form.button
                     type="submit"
                     disabled={@slug_confirmation != @account.slug}
                     style="danger"
                     size="xs"
                   >
                     Delete
-                  </.button>
+                  </Form.button>
                 </div>
               </form>
-              <.flash :if={@error} kind={:error} class="mt-2">
+              <Core.flash :if={@error} kind={:error} class="mt-2">
                 {@error}
-              </.flash>
+              </Core.flash>
             </div>
           </div>
         </div>
@@ -292,12 +325,12 @@ defmodule PortalWeb.Settings.Account do
   defp feature_row(assigns) do
     ~H"""
     <div class="flex items-center gap-2">
-      <.icon
+      <Core.icon
         :if={@enabled}
         name="ri-check-line"
         class="w-3.5 h-3.5 shrink-0 text-success"
       />
-      <.icon
+      <Core.icon
         :if={not @enabled}
         name="ri-subtract-line"
         class="w-3.5 h-3.5 shrink-0 text-subtle"
@@ -332,7 +365,7 @@ defmodule PortalWeb.Settings.Account do
         </div>
         <span class={[
           "text-xs tabular-nums shrink-0 ml-4",
-          @over? && "text-red-500",
+          @over? && "text-danger",
           not @over? && "text-body"
         ]}>
           {@used} / {@limit}
@@ -345,7 +378,7 @@ defmodule PortalWeb.Settings.Account do
           data-pct={bar_pct(@used, @limit)}
           class={[
             "h-full rounded-full transition-all",
-            @over? && "bg-red-500",
+            @over? && "bg-danger",
             not @over? && "bg-brand"
           ]}
         >
@@ -391,10 +424,11 @@ defmodule PortalWeb.Settings.Account do
     ]}>
       <div class="flex items-center justify-between px-5 py-4 border-b border-border">
         <h2 class="text-sm font-semibold text-heading">Edit Account</h2>
-        <.icon_button icon="ri-close-line" title="Close (Esc)" phx-click="close_edit_account" />
+        <Form.icon_button icon="ri-close-line" title="Close (Esc)" phx-click="close_edit_account" />
       </div>
 
       <.form
+        id="account-name-form"
         for={@form}
         phx-change="change_account_name"
         phx-submit="submit_account_name"
@@ -402,21 +436,21 @@ defmodule PortalWeb.Settings.Account do
         class="flex flex-col flex-1 overflow-hidden"
       >
         <div class="flex-1 overflow-y-auto p-5">
-          <.input
+          <Form.input
             field={@form[:name]}
             label="Account Name"
             phx-debounce="300"
           />
         </div>
 
-        <div class="flex items-center justify-end gap-2 px-5 py-4 border-t border-border">
-          <.button type="button" phx-click="close_edit_account" size="xs">
+        <Form.panel_footer>
+          <Form.panel_footer_button type="button" phx-click="close_edit_account">
             Cancel
-          </.button>
-          <.button type="submit" style="primary" disabled={not @form.source.valid?} size="xs">
+          </Form.panel_footer_button>
+          <Form.panel_footer_button type="submit" style="primary" disabled={not @form.source.valid?}>
             Save
-          </.button>
-        </div>
+          </Form.panel_footer_button>
+        </Form.panel_footer>
       </.form>
     </div>
     """
@@ -498,6 +532,11 @@ defmodule PortalWeb.Settings.Account do
   end
 
   def handle_event("redirect_to_billing_portal", _params, socket) do
+    Portal.Analytics.update_marketing_attribution(
+      socket.assigns.account,
+      socket.assigns.marketing_attribution
+    )
+
     with {:ok, billing_portal_url} <-
            Billing.billing_portal_url(
              socket.assigns.account,
@@ -556,7 +595,7 @@ defmodule PortalWeb.Settings.Account do
 
       socket.assigns.slug_confirmation == account.slug ->
         attrs = %{
-          disabled_at: DateTime.utc_now(),
+          is_disabled: true,
           scheduled_deletion_at: DateTime.add(DateTime.utc_now(), 7, :day)
         }
 
@@ -567,6 +606,7 @@ defmodule PortalWeb.Settings.Account do
                account: updated_account,
                confirm_delete_account: false,
                slug_confirmation: "",
+               deletion_feedback_form: deletion_feedback_form(updated_account),
                error: nil
              )}
 
@@ -578,6 +618,54 @@ defmodule PortalWeb.Settings.Account do
       true ->
         {:noreply,
          assign(socket, slug_confirmation: "", error: "Slug does not match, please try again.")}
+    end
+  end
+
+  def handle_event("validate_deletion_feedback", params, socket) do
+    form =
+      socket.assigns.account
+      |> Deletion.change_deletion_feedback(deletion_feedback_param(params))
+      |> Map.put(:action, :validate)
+      |> to_form(as: :account)
+
+    {:noreply, assign(socket, deletion_feedback_form: form)}
+  end
+
+  def handle_event("submit_deletion_feedback", params, socket) do
+    account = socket.assigns.account
+
+    case params |> deletion_feedback_param() |> String.trim() do
+      "" ->
+        {:noreply, assign(socket, deletion_feedback_form: nil)}
+
+      feedback ->
+        case Deletion.save_deletion_feedback(account, feedback, socket.assigns.subject) do
+          {:ok, updated_account} ->
+            {:noreply, assign(socket, account: updated_account, deletion_feedback_form: nil)}
+
+          {:error, %Ecto.Changeset{} = changeset} ->
+            {:noreply, assign(socket, deletion_feedback_form: to_form(changeset, as: :account))}
+
+          {:error, _reason} ->
+            {:noreply, assign(socket, deletion_feedback_form: nil)}
+        end
+    end
+  end
+
+  def handle_event("skip_deletion_feedback", _params, socket) do
+    {:noreply, assign(socket, deletion_feedback_form: nil)}
+  end
+
+  defp deletion_feedback_form(account) do
+    account
+    |> Deletion.change_deletion_feedback()
+    |> to_form(as: :account)
+  end
+
+  defp deletion_feedback_param(params) do
+    case get_in(params, ["account", "metadata", "deletion_feedback"]) do
+      feedback when is_binary(feedback) -> feedback
+      _ -> ""
     end
   end
 
@@ -609,51 +697,47 @@ defmodule PortalWeb.Settings.Account do
     @spec count_account_admin_users_for_account(Portal.Authentication.Subject.t()) :: integer()
     def count_account_admin_users_for_account(subject) do
       from(a in Actor,
-        where: is_nil(a.disabled_at),
+        where: a.is_disabled == false,
         where: a.type == :account_admin_user
       )
-      |> Safe.scoped(subject, :replica)
+      |> Safe.scoped(subject)
       |> Safe.aggregate(:count)
     end
 
     @spec count_service_accounts_for_account(Portal.Authentication.Subject.t()) :: integer()
     def count_service_accounts_for_account(subject) do
       from(a in Actor,
-        where: is_nil(a.disabled_at),
+        where: a.is_disabled == false,
         where: a.type == :service_account
       )
-      |> Safe.scoped(subject, :replica)
+      |> Safe.scoped(subject)
       |> Safe.aggregate(:count)
     end
 
     @spec count_users_for_account(Portal.Authentication.Subject.t()) :: integer()
     def count_users_for_account(subject) do
       from(a in Actor,
-        where: is_nil(a.disabled_at),
+        where: a.is_disabled == false,
         where: a.type in [:account_admin_user, :account_user]
       )
-      |> Safe.scoped(subject, :replica)
+      |> Safe.scoped(subject)
       |> Safe.aggregate(:count)
     end
 
     @spec count_1m_active_users_for_account(Portal.Authentication.Subject.t()) :: integer()
     def count_1m_active_users_for_account(subject) do
       from(d in Device, as: :devices)
-      |> join(:inner, [devices: d], s in Portal.ClientSession,
-        on: s.device_id == d.id and s.account_id == d.account_id,
-        as: :session
-      )
       |> where([devices: d], d.type == :client)
-      |> where([session: s], s.inserted_at > ago(1, "month"))
+      |> where([devices: d], d.last_seen_at > ago(1, "month"))
       |> join(:inner, [devices: d], a in Actor,
         on: d.actor_id == a.id and d.account_id == a.account_id,
         as: :actor
       )
-      |> where([actor: a], is_nil(a.disabled_at))
+      |> where([actor: a], a.is_disabled == false)
       |> where([actor: a], a.type in [:account_user, :account_admin_user])
       |> select([devices: d], d.actor_id)
       |> distinct(true)
-      |> Safe.scoped(subject, :replica)
+      |> Safe.scoped(subject)
       |> Safe.aggregate(:count)
     end
 
@@ -662,7 +746,7 @@ defmodule PortalWeb.Settings.Account do
       from(g in Portal.Site,
         where: g.managed_by == :account
       )
-      |> Safe.scoped(subject, :replica)
+      |> Safe.scoped(subject)
       |> Safe.aggregate(:count)
     end
   end

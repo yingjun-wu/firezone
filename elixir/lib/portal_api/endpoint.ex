@@ -8,7 +8,6 @@ defmodule PortalAPI.Endpoint do
     plug Phoenix.Ecto.SQL.Sandbox
   end
 
-  plug Plug.RewriteOn, [:x_forwarded_host, :x_forwarded_port, :x_forwarded_proto]
   plug Plug.MethodOverride
   plug :put_hsts_header
   plug Plug.Head
@@ -16,12 +15,6 @@ defmodule PortalAPI.Endpoint do
   if code_reloading? do
     plug Phoenix.CodeReloader
   end
-
-  plug RemoteIp,
-    headers: ["x-forwarded-for"],
-    parsers: %{"x-forwarded-for" => Portal.RemoteIp.XForwardedForParser},
-    proxies: {__MODULE__, :external_trusted_proxies, []},
-    clients: {__MODULE__, :clients, []}
 
   plug Portal.Plugs.CountryCodeBlocklist
 
@@ -33,7 +26,6 @@ defmodule PortalAPI.Endpoint do
 
   socket "/gateway", PortalAPI.Gateway.Socket,
     websocket: [
-      transport_log: :debug,
       check_origin: :conn,
       connect_info: [:trace_context_headers, :user_agent, :peer_data, :x_headers],
       error_handler: {PortalAPI.Sockets, :handle_error, []},
@@ -42,11 +34,42 @@ defmodule PortalAPI.Endpoint do
     longpoll: false,
     drainer: []
 
-  socket "/client", PortalAPI.Client.Socket,
+  socket "/gateway/v2", PortalAPI.Gateway.V2.Socket,
     websocket: [
-      transport_log: :debug,
       check_origin: :conn,
       connect_info: [:trace_context_headers, :user_agent, :peer_data, :x_headers],
+      error_handler: {PortalAPI.Sockets, :handle_error, []},
+      timeout: :timer.seconds(37)
+    ],
+    longpoll: false,
+    drainer: []
+
+  # Client sockets take `:uri` so device trust can tell a connect on the
+  # mutual-TLS origin from one on the plain API origin.
+  socket "/client", PortalAPI.Client.Socket,
+    websocket: [
+      check_origin: :conn,
+      connect_info: [:trace_context_headers, :user_agent, :peer_data, :x_headers, :uri],
+      error_handler: {PortalAPI.Sockets, :handle_error, []},
+      timeout: :timer.seconds(37)
+    ],
+    longpoll: false,
+    drainer: []
+
+  socket "/client/v2", PortalAPI.Client.V2.Socket,
+    websocket: [
+      check_origin: :conn,
+      connect_info: [:trace_context_headers, :user_agent, :peer_data, :x_headers, :uri],
+      error_handler: {PortalAPI.Sockets, :handle_error, []},
+      timeout: :timer.seconds(37)
+    ],
+    longpoll: false,
+    drainer: []
+
+  socket "/client/v3", PortalAPI.Client.V3.Socket,
+    websocket: [
+      check_origin: :conn,
+      connect_info: [:trace_context_headers, :user_agent, :peer_data, :x_headers, :uri],
       error_handler: {PortalAPI.Sockets, :handle_error, []},
       timeout: :timer.seconds(37)
     ],
@@ -55,7 +78,6 @@ defmodule PortalAPI.Endpoint do
 
   socket "/relay", PortalAPI.Relay.Socket,
     websocket: [
-      transport_log: :debug,
       check_origin: :conn,
       connect_info: [:trace_context_headers, :user_agent, :peer_data, :x_headers],
       error_handler: {PortalAPI.Sockets, :handle_error, []},
@@ -65,7 +87,8 @@ defmodule PortalAPI.Endpoint do
     drainer: []
 
   plug :fetch_user_agent
-  plug PortalAPI.Router
+
+  plug PortalAPI.Plugs.RescueRouterErrors
 
   plug Sentry.PlugContext
 
@@ -90,24 +113,5 @@ defmodule PortalAPI.Endpoint do
     else
       conn
     end
-  end
-
-  def real_ip_opts do
-    [
-      headers: ["x-forwarded-for"],
-      parsers: %{"x-forwarded-for" => Portal.RemoteIp.XForwardedForParser},
-      proxies: {__MODULE__, :external_trusted_proxies, []},
-      clients: {__MODULE__, :clients, []}
-    ]
-  end
-
-  def external_trusted_proxies do
-    Portal.Config.fetch_env!(:portal, :external_trusted_proxies)
-    |> Enum.map(&to_string/1)
-  end
-
-  def clients do
-    Portal.Config.fetch_env!(:portal, :private_clients)
-    |> Enum.map(&to_string/1)
   end
 end

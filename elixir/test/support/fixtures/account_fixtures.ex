@@ -29,10 +29,7 @@ defmodule Portal.AccountFixtures do
       },
       features: %{
         policy_conditions: true,
-        traffic_filters: true,
         idp_sync: true,
-        rest_api: true,
-        client_to_client: false,
         iceless: false
       },
       limits: %{
@@ -90,26 +87,14 @@ defmodule Portal.AccountFixtures do
   end
 
   @doc """
-  Generate an account with an Enterprise plan.
-  """
-  def enterprise_account_fixture(attrs \\ %{}) do
-    account = account_fixture(attrs)
-
-    account
-    |> cast(%{metadata: %{stripe: %{product_name: "Enterprise"}}}, [])
-    |> cast_embed(:metadata)
-    |> Repo.update!()
-  end
-
-  @doc """
   Generate a disabled account.
   """
   def disabled_account_fixture(attrs \\ %{}) do
     account = account_fixture(attrs)
 
     account
-    |> cast(%{disabled_at: DateTime.utc_now(), disabled_reason: "Testing"}, [
-      :disabled_at,
+    |> cast(%{is_disabled: true, disabled_reason: "Testing"}, [
+      :is_disabled,
       :disabled_reason
     ])
     |> Repo.update!()
@@ -127,7 +112,7 @@ defmodule Portal.AccountFixtures do
       :legal_name,
       :slug,
       :key,
-      :disabled_at,
+      :is_disabled,
       :scheduled_deletion_at,
       :disabled_reason,
       :users_limit_exceeded,
@@ -156,5 +141,42 @@ defmodule Portal.AccountFixtures do
   """
   def fetch_account(account_id) do
     Repo.get(Portal.Account, account_id)
+  end
+
+  @doc "Generate an account with recent session activity."
+  def active_account_fixture(attrs \\ %{}) do
+    account = account_fixture(attrs)
+    Portal.SessionLogFixtures.session_log_fixture(account: account)
+
+    account
+  end
+
+  @doc "Generate a provisioned Starter account with recent session activity."
+  def provisioned_account_fixture(attrs \\ %{}) do
+    account = dormant_provisioned_account_fixture(attrs)
+    Portal.SessionLogFixtures.session_log_fixture(account: account)
+
+    account
+  end
+
+  @doc "Generate a provisioned Starter account without session activity."
+  def dormant_provisioned_account_fixture(attrs \\ %{}) do
+    attrs = Enum.into(attrs, %{})
+    account = account_fixture(attrs)
+
+    stripe_attrs =
+      Map.merge(
+        %{
+          customer_id: "cus_#{System.unique_integer([:positive])}",
+          subscription_id: "sub_#{System.unique_integer([:positive])}",
+          product_name: "Starter"
+        },
+        get_in(attrs, [:metadata, :stripe]) || %{}
+      )
+
+    account
+    |> Ecto.Changeset.cast(%{metadata: %{stripe: stripe_attrs}}, [])
+    |> Ecto.Changeset.cast_embed(:metadata)
+    |> Repo.update!()
   end
 end

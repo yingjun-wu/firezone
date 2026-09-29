@@ -46,13 +46,30 @@ public final class Log {
     }
   }
 
-  private static let processName: String = {
+  nonisolated(unsafe) private static var isCLI = false
+  nonisolated(unsafe) private static var mirrorsLog = false
+
+  /// Tags logs as coming from the CLI and, with `debug`, mirrors them to stderr.
+  ///
+  /// The CLI is the app's own binary under another name, so nothing about the bundle
+  /// tells them apart. Call once at startup, before logging anything.
+  ///
+  /// The log is the app talking to itself, and a command that fails throws, so none of
+  /// it reaches the terminal by default. `debug` mirrors all of it, which is what to
+  /// ask someone for.
+  public static func useCLIOutput(debug: Bool = false) {
+    isCLI = true
+    mirrorsLog = debug
+  }
+
+  private static var processName: String {
+    if isCLI { return "cli" }
     switch Bundle.main.bundleIdentifier {
     case "dev.firezone.firezone": return "app"
     case "dev.firezone.firezone.network-extension": return "tunnel"
     default: return "unknown"
     }
-  }()
+  }
 
   private static let logger: Logger = {
     let category = processName
@@ -101,30 +118,35 @@ public final class Log {
     logger.trace("\(message, privacy: .public)")
     logWriter?.write(severity: .trace, message: message)
     sentryLog(severity: .trace, message: message)
+    writeToStderr(.trace, message)
   }
 
   public static func debug(_ message: String) {
     self.logger.debug("\(message, privacy: .public)")
     logWriter?.write(severity: .debug, message: message)
     sentryLog(severity: .debug, message: message)
+    writeToStderr(.debug, message)
   }
 
   public static func info(_ message: String) {
     logger.info("\(message, privacy: .public)")
     logWriter?.write(severity: .info, message: message)
     sentryLog(severity: .info, message: message)
+    writeToStderr(.info, message)
   }
 
   public static func warning(_ message: String) {
     logger.warning("\(message, privacy: .public)")
     logWriter?.write(severity: .warning, message: message)
     sentryLog(severity: .warning, message: message)
+    writeToStderr(.warning, message)
   }
 
   public static func error(_ message: String) {
     self.logger.error("\(message, privacy: .public)")
     logWriter?.write(severity: .error, message: message)
     sentryLog(severity: .error, message: message)
+    writeToStderr(.error, message)
   }
 
   public static func error(_ err: Error) {
@@ -137,6 +159,8 @@ public final class Log {
 
   // Returns the size in bytes of the provided directory, calculated by summing
   // the size of its contents recursively.
+  // @concurrent: walking a large log tree must not run on the caller's actor.
+  @concurrent
   public static func size(of directory: URL) async -> Int64 {
     let fileManager = FileManager.default
     var totalSize: Int64 = 0
@@ -173,7 +197,20 @@ public final class Log {
     guard let directory = directory
     else { return }
 
-    try FileManager.default.removeItem(at: directory)
+    let fileManager = FileManager.default
+    let items = try fileManager.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+    for item in items {
+      try fileManager.removeItem(at: item)
+    }
+  }
+
+  private static func writeToStderr(_ severity: LogWriter.Severity, _ message: String) {
+    guard mirrorsLog else { return }
+
+    var line = "\(severity.rawValue) \(message)\n"
+    line.withUTF8 { buffer in
+      _ = fwrite(buffer.baseAddress, 1, buffer.count, stderr)
+    }
   }
 
   // Don't capture certain kinds of IPC and security errors in DEBUG builds
@@ -188,6 +225,48 @@ public final class Log {
     #endif
 
     return true
+  }
+}
+
+extension FileManager {
+  enum FileManagerError: Error {
+    case invalidURL(URL, Error)
+
+    var localizedDescription: String {
+      switch self {
+      case .invalidURL(let url, let error):
+        return "Unable to get resource value for '\(url)': \(error)"
+      }
+    }
+  }
+
+  func forEachFileUnder(
+    _ dirURL: URL,
+    including resourceKeys: Set<URLResourceKey>,
+    handler: (URL, URLResourceValues) -> Void
+  ) {
+    // Deep-traverses the directory at dirURL
+    guard
+      let enumerator = self.enumerator(
+        at: dirURL,
+        includingPropertiesForKeys: [URLResourceKey](resourceKeys),
+        options: [],
+        errorHandler: nil
+      )
+    else {
+      return
+    }
+
+    for item in enumerator.enumerated() {
+      if Task.isCancelled { break }
+      guard let url = item.element as? URL else { continue }
+      do {
+        let resourceValues = try url.resourceValues(forKeys: resourceKeys)
+        handler(url, resourceValues)
+      } catch {
+        Log.error(FileManagerError.invalidURL(url, error))
+      }
+    }
   }
 }
 

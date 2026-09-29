@@ -113,6 +113,50 @@ defmodule Portal.Workers.CheckAccountLimitsTest do
       assert first_email.text_body =~ "account admins (3 / 1)"
     end
 
+    test "sets limit flags but sends no email for an account with no session logs" do
+      account = dormant_provisioned_account_fixture()
+      admin_actor_fixture(account: account)
+      admin_actor_fixture(account: account)
+      admin_actor_fixture(account: account)
+
+      update_account(account, %{
+        limits: %{
+          account_admin_users_count: 1
+        }
+      })
+
+      assert :ok = perform_job(CheckAccountLimits, %{})
+
+      refute_email_queued(account.id)
+
+      account = Repo.get!(Portal.Account, account.id)
+      assert account.admins_limit_exceeded
+      # The reminder clock only starts once there is somebody to remind.
+      refute account.warning_last_sent_at
+    end
+
+    test "sends email to a paid account with no session logs" do
+      account =
+        dormant_provisioned_account_fixture(%{metadata: %{stripe: %{product_name: "Team"}}})
+
+      admin_actor_fixture(account: account)
+      admin_actor_fixture(account: account)
+      admin_actor_fixture(account: account)
+
+      update_account(account, %{
+        limits: %{
+          account_admin_users_count: 1
+        }
+      })
+
+      assert :ok = perform_job(CheckAccountLimits, %{})
+
+      assert [_email] = collect_queued_emails(account.id)
+
+      account = Repo.get!(Portal.Account, account.id)
+      assert account.warning_last_sent_at
+    end
+
     test "does not send email if warning_last_sent_at is less than 3 days ago" do
       account = provisioned_account_fixture()
       admin_actor_fixture(account: account)
@@ -222,7 +266,7 @@ defmodule Portal.Workers.CheckAccountLimitsTest do
 
       # Disable the account
       account
-      |> Ecto.Changeset.change(disabled_at: DateTime.utc_now(), disabled_reason: "Test")
+      |> Ecto.Changeset.change(is_disabled: true, disabled_reason: "Test")
       |> Repo.update!()
 
       assert :ok = perform_job(CheckAccountLimits, %{})
@@ -268,7 +312,7 @@ defmodule Portal.Workers.CheckAccountLimitsTest do
       disabled_admin = admin_actor_fixture(account: account)
 
       disabled_admin
-      |> Ecto.Changeset.change(disabled_at: DateTime.utc_now())
+      |> Ecto.Changeset.change(is_disabled: true)
       |> Repo.update!()
 
       # Create another enabled admin
@@ -439,24 +483,5 @@ defmodule Portal.Workers.CheckAccountLimitsTest do
       account = Repo.get!(Portal.Account, account.id)
       assert account.seats_limit_exceeded
     end
-  end
-
-  defp provisioned_account_fixture(attrs \\ %{}) do
-    account = account_fixture(attrs)
-
-    stripe_attrs =
-      Map.merge(
-        %{
-          customer_id: "cus_#{System.unique_integer([:positive])}",
-          subscription_id: "sub_#{System.unique_integer([:positive])}",
-          product_name: "Team"
-        },
-        get_in(attrs, [:metadata, :stripe]) || %{}
-      )
-
-    account
-    |> Ecto.Changeset.cast(%{metadata: %{stripe: stripe_attrs}}, [])
-    |> Ecto.Changeset.cast_embed(:metadata)
-    |> Repo.update!()
   end
 end

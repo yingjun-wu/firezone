@@ -1,6 +1,7 @@
 defmodule Portal.BillingTest do
   use Portal.DataCase, async: true
 
+  import Ecto.Query
   import ExUnit.CaptureLog
   import Portal.Billing
   import Portal.AccountFixtures
@@ -338,11 +339,58 @@ defmodule Portal.BillingTest do
 
       # Disable the enabled one
       api_client
-      |> Ecto.Changeset.change(disabled_at: DateTime.utc_now())
+      |> Ecto.Changeset.change(is_disabled: true)
       |> Portal.Repo.update!()
 
       # Now we can create more
       assert can_create_api_clients?(account)
+    end
+  end
+
+  describe "check_actor_enable_limits/2" do
+    test "rejects a user when the user limit is reached", %{account: account} do
+      account = update_account(account, %{limits: %{users_count: 0}})
+      actor = disabled_actor_fixture(account: account, type: :account_user)
+
+      assert check_actor_enable_limits(account, actor) == {:error, :users_limit_reached}
+    end
+
+    test "rejects an admin when the user limit is reached", %{account: account} do
+      account = update_account(account, %{limits: %{users_count: 0}})
+      actor = disabled_actor_fixture(account: account, type: :account_admin_user)
+
+      assert check_actor_enable_limits(account, actor) == {:error, :users_limit_reached}
+    end
+
+    test "rejects an admin when the admin limit is reached", %{account: account} do
+      account = update_account(account, %{limits: %{account_admin_users_count: 0}})
+      actor = disabled_actor_fixture(account: account, type: :account_admin_user)
+
+      assert check_actor_enable_limits(account, actor) == {:error, :admin_users_limit_reached}
+    end
+
+    test "rejects a service account when the service account limit is reached", %{
+      account: account
+    } do
+      account = update_account(account, %{limits: %{service_accounts_count: 0}})
+      actor = disabled_actor_fixture(account: account, type: :service_account)
+
+      assert check_actor_enable_limits(account, actor) ==
+               {:error, :service_accounts_limit_reached}
+    end
+
+    test "rejects an API client when the API client limit is reached", %{account: account} do
+      account = update_account(account, %{limits: %{api_clients_count: 0}})
+      actor = disabled_actor_fixture(account: account, type: :api_client)
+
+      assert check_actor_enable_limits(account, actor) == {:error, :api_clients_limit_reached}
+    end
+
+    test "allows all actor types when limits are not reached", %{account: account} do
+      for type <- [:account_user, :account_admin_user, :service_account, :api_client] do
+        actor = disabled_actor_fixture(account: account, type: type)
+        assert check_actor_enable_limits(account, actor) == :ok
+      end
     end
   end
 
@@ -705,6 +753,97 @@ defmodule Portal.BillingTest do
       assert {:ok, _resource} = Portal.Billing.Database.fetch_internet_resource(account)
     end
 
+    test "creates the Your devices pool, the Account owner group and the policy", %{
+      account: account
+    } do
+      Portal.Config.put_env_override(Portal.Billing, enabled: false)
+      admin = actor_fixture(account: account, type: :account_admin_user)
+
+      assert {:ok, ^account} = Portal.Billing.provision_account(account)
+
+      pool = Portal.Repo.get_by!(Portal.Resource, account_id: account.id, type: :device_pool)
+      assert pool.name == "Your devices"
+
+      assert pool.device_membership_criteria ==
+               Portal.Resource.DeviceMembershipCriteria.own_devices()
+
+      owner_group =
+        Portal.Repo.get_by!(Portal.Group, account_id: account.id, name: "Account owner")
+
+      assert owner_group.type == :static
+
+      policy = Portal.Repo.get_by!(Portal.Policy, account_id: account.id, resource_id: pool.id)
+      assert policy.group_id == owner_group.id
+
+      assert Portal.Repo.get_by!(Portal.Membership,
+               account_id: account.id,
+               group_id: owner_group.id,
+               actor_id: admin.id
+             )
+    end
+
+    test "puts the oldest admin in the Account owner group", %{account: account} do
+      Portal.Config.put_env_override(Portal.Billing, enabled: false)
+      first = actor_fixture(account: account, type: :account_admin_user)
+      _second = actor_fixture(account: account, type: :account_admin_user)
+
+      assert {:ok, ^account} = Portal.Billing.provision_account(account)
+
+      owner_group =
+        Portal.Repo.get_by!(Portal.Group, account_id: account.id, name: "Account owner")
+
+      assert [membership] =
+               Portal.Repo.all(
+                 from(m in Portal.Membership,
+                   where: m.account_id == ^account.id and m.group_id == ^owner_group.id
+                 )
+               )
+
+      assert membership.actor_id == first.id
+    end
+
+    test "leaves the defaults alone when they are already there", %{account: account} do
+      Portal.Config.put_env_override(Portal.Billing, enabled: false)
+      actor_fixture(account: account, type: :account_admin_user)
+
+      assert {:ok, ^account} = Portal.Billing.provision_account(account)
+      pool = Portal.Repo.get_by!(Portal.Resource, account_id: account.id, type: :device_pool)
+
+      assert {:ok, ^account} = Portal.Billing.provision_account(account)
+
+      assert [^pool] =
+               Portal.Repo.all(
+                 from(r in Portal.Resource,
+                   where: r.account_id == ^account.id and r.type == :device_pool
+                 )
+               )
+
+      assert Portal.Repo.aggregate(
+               from(g in Portal.Group,
+                 where: g.account_id == ^account.id and g.name == "Account owner"
+               ),
+               :count
+             ) == 1
+    end
+
+    test "creates the group without a membership when the account has no admin", %{
+      account: account
+    } do
+      Portal.Config.put_env_override(Portal.Billing, enabled: false)
+
+      assert {:ok, ^account} = Portal.Billing.provision_account(account)
+
+      owner_group =
+        Portal.Repo.get_by!(Portal.Group, account_id: account.id, name: "Account owner")
+
+      assert Portal.Repo.aggregate(
+               from(m in Portal.Membership,
+                 where: m.account_id == ^account.id and m.group_id == ^owner_group.id
+               ),
+               :count
+             ) == 0
+    end
+
     test "returns error when provisioning fails", %{account: account} do
       Stripe.stub([{"POST", "/v1/customers", 500, %{"error" => "Server error"}}])
 
@@ -922,10 +1061,9 @@ defmodule Portal.BillingTest do
         )
 
       # Backdate the session to more than a month ago
-      Repo.query!("UPDATE client_sessions SET inserted_at = $1 WHERE id = $2", [
-        DateTime.add(DateTime.utc_now(), -35, :day),
-        Ecto.UUID.dump!(session.id)
-      ])
+      session
+      |> Ecto.Changeset.change(last_seen_at: DateTime.add(DateTime.utc_now(), -35, :day))
+      |> Repo.update!()
 
       assert Portal.Billing.Database.count_1m_active_users_for_account(account) == 1
     end

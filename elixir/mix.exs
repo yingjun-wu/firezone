@@ -16,10 +16,11 @@ defmodule Portal.MixProject do
     [
       app: :portal,
       version: version(),
-      elixir: "~> 1.14",
+      elixir: "~> 1.15",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
       test_coverage: [tool: ExCoveralls],
+      test_ignore_filters: [~r"^test/fixtures/"],
       listeners: listeners(),
       docs: [
         logo: "assets/static/images/logo.svg",
@@ -68,7 +69,6 @@ defmodule Portal.MixProject do
     [
       # Ecto / Database
       {:postgrex, "~> 0.20"},
-      {:decimal, "~> 3.0"},
       {:ecto_sql, "~> 3.7"},
       {:ecto_psql_extras, "~> 0.8"},
       {:phoenix_ecto, "~> 4.4"},
@@ -81,7 +81,11 @@ defmodule Portal.MixProject do
       {:phoenix_live_view, "~> 1.1"},
       {:phoenix_live_dashboard, "~> 0.8"},
       {:phoenix_live_reload, "~> 1.2", only: :dev},
-      {:bandit, "~> 1.0"},
+      # Temporary fix for unread HTTP/2 bodies: https://github.com/mtrudel/bandit/issues/697
+      {:bandit,
+       github: "firezone/bandit",
+       ref: "01617e0b7fc679a75058d1373d87cf50395ff1fb",
+       override: true},
       {:plug, "~> 1.15"},
       {:gettext, "~> 1.0"},
       {:remote_ip, "~> 1.1"},
@@ -89,8 +93,6 @@ defmodule Portal.MixProject do
       # Auth
       {:plug_crypto, "~> 2.0"},
       {:jose, "~> 1.11"},
-      {:openid_connect,
-       github: "firezone/openid_connect", ref: "a38b96eb63bef690328ad2fd08202b8ffe36460f"},
       {:argon2_elixir, "~> 4.0"},
 
       # Background jobs
@@ -101,12 +103,10 @@ defmodule Portal.MixProject do
       {:libcluster, "~> 3.3"},
       {:tz, "~> 0.28"},
       {:tz_extra, "~> 0.45"},
-      {:sizeable, "~> 1.0"},
 
       # Email
       {:gen_smtp, "~> 1.0"},
-      {:multipart, "~> 0.6.0"},
-      {:swoosh, "~> 1.26.0"},
+      {:swoosh, "~> 1.28.0"},
       {:phoenix_swoosh, "~> 1.0"},
 
       # IP Geolocation
@@ -116,14 +116,17 @@ defmodule Portal.MixProject do
       # API / OpenAPI
       {:open_api_spex, "~> 3.22.0"},
       {:ymlr, "~> 5.0"},
-      {:hammer, "~> 7.4.0"},
+      {:hammer, "~> 7.5.0"},
+
+      # AWS request signing
+      {:aws_signature, "~> 0.4"},
 
       # Observability
       {:telemetry, "~> 1.0"},
       {:telemetry_poller, "~> 1.0"},
       {:telemetry_metrics, "~> 1.0"},
       {:recon, "~> 2.5"},
-      {:observer_cli, "~> 1.7"},
+      {:observer_cli, "~> 2.0"},
       {:opentelemetry, "~> 1.5"},
       {:opentelemetry_logger_metadata, "~> 0.2.0"},
       {:opentelemetry_api_experimental,
@@ -148,13 +151,12 @@ defmodule Portal.MixProject do
       # https://github.com/open-telemetry/opentelemetry-erlang-contrib/issues/428
       {:opentelemetry_semantic_conventions, "~> 1.27", override: true},
       {:sentry, "~> 13.1"},
-      {:hackney, "~> 1.19"},
       {:logger_json, "~> 7.0"},
-      {:req, "~> 0.5.15"},
+      {:req, "~> 0.7.2"},
 
       # Asset pipeline
       {:esbuild, "~> 0.7", runtime: Mix.env() == :dev},
-      {:tailwind, "~> 0.4.1", runtime: Mix.env() == :dev},
+      {:tailwind, "~> 0.5.1", runtime: Mix.env() == :dev},
       {:remixicons,
        github: "Remix-Design/RemixIcon",
        sparse: "icons",
@@ -164,7 +166,6 @@ defmodule Portal.MixProject do
        depth: 1},
 
       # Test deps
-      {:bypass, "~> 2.1", only: :test},
       {:floki, "~> 0.38.0", only: :test},
       {:lazy_html, ">= 0.1.0", only: :test},
       {:excoveralls, "~> 0.18", only: :test},
@@ -202,7 +203,10 @@ defmodule Portal.MixProject do
       "assets.build": ["tailwind portal", "esbuild portal"],
       "assets.deploy": ["tailwind portal --minify", "esbuild portal --minify", "phx.digest"],
       "phx.server": ["ecto.create --quiet", "ecto.migrate", "phx.server"],
-      test: ["ecto.create --quiet", "ecto.migrate", "test"],
+      "openapi.generate": [
+        "openapi.spec.json --spec PortalAPI.ApiSpec --pretty=true --vendor-extensions=false --filename priv/static/openapi.json --no-start-app"
+      ],
+      test: ["ecto.create --quiet", "ecto.migrate", "openapi.generate", "test"],
       start: ["compile --no-validate-compile-env", "phx.server", "run --no-halt"]
     ]
   end

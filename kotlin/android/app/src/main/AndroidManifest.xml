@@ -28,8 +28,7 @@
         android:label="@string/app_name"
         android:screenOrientation="portrait"
         android:supportsRtl="true"
-        android:theme="@style/AppTheme.Base"
-        android:usesCleartextTraffic="true">
+        android:theme="@style/AppTheme.Base">
 
         <receiver
             android:name=".core.BootReceiver"
@@ -63,7 +62,9 @@
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
-                <data android:scheme="firezone-fd0020211111" />
+                <data
+                    android:host="handle_client_sign_in_callback"
+                    android:scheme="firezone-fd0020211111" />
             </intent-filter>
         </activity>
 
@@ -73,6 +74,10 @@
 
         <activity
             android:name="dev.firezone.android.features.permission.notification.ui.NotificationPermissionActivity"
+            android:exported="false" />
+
+        <activity
+            android:name="dev.firezone.android.features.permission.certificate.ui.CertificatePermissionActivity"
             android:exported="false" />
 
         <activity

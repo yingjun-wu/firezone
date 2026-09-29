@@ -2,7 +2,7 @@ defmodule PortalWeb.Actors do
   use PortalWeb, :live_view
 
   alias __MODULE__.Database
-  import PortalWeb.Actors.Components
+  alias PortalWeb.Actors.Components, as: ActorComponents
 
   alias Portal.Actor
   alias Portal.Authentication
@@ -23,6 +23,7 @@ defmodule PortalWeb.Actors do
 
     if connected?(socket) do
       :ok = PubSub.Changes.subscribe(socket.assigns.account.id, :actors)
+      :ok = Presence.Devices.Account.subscribe(socket.assigns.account.id)
     end
 
     socket =
@@ -31,11 +32,10 @@ defmodule PortalWeb.Actors do
       |> assign_async(:actors_count, fn -> {:ok, %{actors_count: Database.count_actors(subject)}} end)
       |> assign(
         selected_actor: nil,
-        portal_sessions_subscribed_actor_id: nil,
-        client_tokens_subscribed_actor_id: nil
+        portal_sessions_subscribed_actor_id: nil
       )
       |> assign(base_actor_assigns())
-      |> assign_live_table("actors",
+      |> LiveTable.assign_live_table("actors",
         query_module: Database,
         sortable_fields: [
           {:actors, :name},
@@ -50,7 +50,7 @@ defmodule PortalWeb.Actors do
 
   # New Person Panel — skip type selection, go straight to user form
   def handle_params(params, uri, %{assigns: %{live_action: :new}} = socket) do
-    socket = handle_live_tables_params(socket, params, uri)
+    socket = LiveTable.handle_live_tables_params(socket, params, uri)
     changeset = changeset(%Actor{}, %{type: :account_user})
 
     {:noreply,
@@ -63,7 +63,7 @@ defmodule PortalWeb.Actors do
 
   # Show Actor Panel
   def handle_params(%{"id" => id} = params, uri, %{assigns: %{live_action: :show}} = socket) do
-    socket = handle_live_tables_params(socket, params, uri)
+    socket = LiveTable.handle_live_tables_params(socket, params, uri)
 
     if selected_actor_matches?(socket, id) do
       actor = socket.assigns.selected_actor
@@ -81,7 +81,6 @@ defmodule PortalWeb.Actors do
           confirm_delete_session_id: nil
         )
         |> subscribe_portal_sessions(actor)
-        |> subscribe_client_tokens(actor)
 
       {:noreply, socket}
     else
@@ -92,7 +91,7 @@ defmodule PortalWeb.Actors do
   # Edit Actor Panel
   def handle_params(%{"id" => id} = params, uri, %{assigns: %{live_action: :edit}} = socket) do
     with {:ok, actor} <- Database.get_actor(id, socket.assigns.subject) do
-      socket = handle_live_tables_params(socket, params, uri)
+      socket = LiveTable.handle_live_tables_params(socket, params, uri)
       changeset = changeset(actor, %{})
 
       is_last_admin =
@@ -129,48 +128,42 @@ defmodule PortalWeb.Actors do
 
   # Default handler - list view, no selection
   def handle_params(params, uri, socket) do
-    socket = handle_live_tables_params(socket, params, uri)
+    socket = LiveTable.handle_live_tables_params(socket, params, uri)
 
     socket =
       socket
       |> assign(selected_actor: nil)
       |> assign(base_actor_assigns())
       |> unsubscribe_portal_sessions()
-      |> unsubscribe_client_tokens()
 
     {:noreply, socket}
   end
 
   def handle_event(event, params, socket)
       when event in ["paginate", "order_by", "filter", "table_row_click", "change_limit"],
-      do: handle_live_table_event(event, params, socket)
+      do: LiveTable.handle_live_table_event(event, params, socket)
 
   def handle_event(
         "close_panel",
         _params,
         %{assigns: %{actor_panel: %{creating_actor: true}}} = socket
       ) do
-    params = Map.drop(socket.assigns.query_params, ["tab"])
-    {:noreply, push_patch(socket, to: ~p"/#{socket.assigns.account}/actors?#{params}")}
+    {:noreply, push_patch(socket, to: LiveTable.live_table_path(socket, ~p"/#{socket.assigns.account}/actors"))}
   end
 
   def handle_event("close_panel", _params, socket) do
-    params = Map.drop(socket.assigns.query_params, ["tab"])
-    {:noreply, push_patch(socket, to: ~p"/#{socket.assigns.account}/actors?#{params}")}
+    {:noreply, push_patch(socket, to: LiveTable.live_table_path(socket, ~p"/#{socket.assigns.account}/actors"))}
   end
 
   def handle_event("handle_keydown", _params, %{assigns: %{live_action: :edit}} = socket)
       when not is_nil(socket.assigns.selected_actor) do
     {:noreply,
-     push_patch(socket,
-       to: ~p"/#{socket.assigns.account}/actors/#{socket.assigns.selected_actor.id}"
-     )}
+     push_patch(socket, to: LiveTable.live_table_path(socket, ~p"/#{socket.assigns.account}/actors/#{socket.assigns.selected_actor.id}"))}
   end
 
   def handle_event("handle_keydown", _params, socket)
       when not is_nil(socket.assigns.selected_actor) do
-    params = Map.drop(socket.assigns.query_params, ["tab"])
-    {:noreply, push_patch(socket, to: ~p"/#{socket.assigns.account}/actors?#{params}")}
+    {:noreply, push_patch(socket, to: LiveTable.live_table_path(socket, ~p"/#{socket.assigns.account}/actors"))}
   end
 
   def handle_event(
@@ -178,8 +171,7 @@ defmodule PortalWeb.Actors do
         _params,
         %{assigns: %{actor_panel: %{creating_actor: true}}} = socket
       ) do
-    params = Map.drop(socket.assigns.query_params, ["tab"])
-    {:noreply, push_patch(socket, to: ~p"/#{socket.assigns.account}/actors?#{params}")}
+    {:noreply, push_patch(socket, to: LiveTable.live_table_path(socket, ~p"/#{socket.assigns.account}/actors"))}
   end
 
   def handle_event("handle_keydown", _params, socket) do
@@ -187,7 +179,7 @@ defmodule PortalWeb.Actors do
   end
 
   def handle_event("open_new_actor_panel", _params, socket) do
-    {:noreply, push_patch(socket, to: ~p"/#{socket.assigns.account}/actors/new")}
+    {:noreply, push_patch(socket, to: LiveTable.live_table_path(socket, ~p"/#{socket.assigns.account}/actors/new"))}
   end
 
   def handle_event("select_new_actor_type", %{"type" => "user"}, socket) do
@@ -211,16 +203,12 @@ defmodule PortalWeb.Actors do
 
   def handle_event("open_actor_edit_form", _params, socket) do
     {:noreply,
-     push_patch(socket,
-       to: ~p"/#{socket.assigns.account}/actors/#{socket.assigns.selected_actor.id}/edit"
-     )}
+     push_patch(socket, to: LiveTable.live_table_path(socket, ~p"/#{socket.assigns.account}/actors/#{socket.assigns.selected_actor.id}/edit"))}
   end
 
   def handle_event("cancel_actor_edit_form", _params, socket) do
     {:noreply,
-     push_patch(socket,
-       to: ~p"/#{socket.assigns.account}/actors/#{socket.assigns.selected_actor.id}"
-     )}
+     push_patch(socket, to: LiveTable.live_table_path(socket, ~p"/#{socket.assigns.account}/actors/#{socket.assigns.selected_actor.id}"))}
   end
 
   def handle_event("validate", %{"actor" => attrs} = params, socket) do
@@ -358,8 +346,8 @@ defmodule PortalWeb.Actors do
               socket
               |> apply_group_membership_changes(actor, socket.assigns.subject)
               |> put_flash(:success, "User created successfully")
-              |> reload_live_table!("actors")
-              |> push_patch(to: ~p"/#{socket.assigns.account}/actors/#{actor.id}")
+              |> LiveTable.reload_live_table!("actors")
+              |> push_patch(to: LiveTable.live_table_path(socket, ~p"/#{socket.assigns.account}/actors/#{actor.id}"))
 
             {:noreply, socket}
 
@@ -391,8 +379,8 @@ defmodule PortalWeb.Actors do
           socket =
             socket
             |> apply_group_membership_changes(actor, socket.assigns.subject)
-            |> reload_live_table!("actors")
-            |> push_patch(to: ~p"/#{socket.assigns.account}/actors/#{actor.id}")
+            |> LiveTable.reload_live_table!("actors")
+            |> push_patch(to: LiveTable.live_table_path(socket, ~p"/#{socket.assigns.account}/actors/#{actor.id}"))
 
           {:noreply, socket}
 
@@ -400,9 +388,9 @@ defmodule PortalWeb.Actors do
           socket =
             socket
             |> apply_group_membership_changes(actor, socket.assigns.subject)
-            |> reload_live_table!("actors")
+            |> LiveTable.reload_live_table!("actors")
             |> merge_state(:actor_related, created_token: encoded_token)
-            |> push_patch(to: ~p"/#{socket.assigns.account}/actors/#{actor.id}")
+            |> push_patch(to: LiveTable.live_table_path(socket, ~p"/#{socket.assigns.account}/actors/#{actor.id}"))
 
           {:noreply, socket}
 
@@ -476,8 +464,8 @@ defmodule PortalWeb.Actors do
       {:noreply,
        socket
        |> put_flash(:success, "Actor deleted successfully")
-       |> reload_live_table!("actors")
-       |> push_patch(to: ~p"/#{socket.assigns.account}/actors")}
+       |> LiveTable.reload_live_table!("actors")
+       |> push_patch(to: LiveTable.live_table_path(socket, ~p"/#{socket.assigns.account}/actors"))}
     else
       {:error, :not_found} ->
         {:noreply, put_flash(socket, :error, "Actor not found")}
@@ -499,11 +487,11 @@ defmodule PortalWeb.Actors do
          {:ok, updated_actor} <-
            actor
            |> change()
-           |> put_change(:disabled_at, DateTime.utc_now())
+           |> put_change(:is_disabled, true)
            |> Database.update(socket.assigns.subject) do
       socket =
         socket
-        |> reload_live_table!("actors")
+        |> LiveTable.reload_live_table!("actors")
         |> merge_state(:actor_panel, confirm_disable_actor: false)
         |> maybe_update_actor_assign(id, updated_actor)
 
@@ -524,15 +512,16 @@ defmodule PortalWeb.Actors do
   end
 
   def handle_event("enable", %{"id" => id}, socket) do
-    with {:ok, actor} <- Database.get_actor(id, socket.assigns.subject) do
+    with {:ok, actor} <- Database.get_actor(id, socket.assigns.subject),
+         :ok <- Portal.Billing.check_actor_enable_limits(socket.assigns.account, actor) do
       case actor
            |> change()
-           |> put_change(:disabled_at, nil)
+           |> put_change(:is_disabled, false)
            |> Database.update(socket.assigns.subject) do
         {:ok, updated_actor} ->
           socket =
             socket
-            |> reload_live_table!("actors")
+            |> LiveTable.reload_live_table!("actors")
             |> maybe_update_actor_assign(id, updated_actor)
 
           {:noreply, put_flash(socket, :success_inline, "Actor enabled successfully")}
@@ -546,16 +535,25 @@ defmodule PortalWeb.Actors do
 
       {:error, :unauthorized} ->
         {:noreply, put_flash(socket, :error, "You are not authorized to enable this actor")}
+
+      {:error, :users_limit_reached} ->
+        {:noreply, put_flash(socket, :error, "User limit reached for your account")}
+
+      {:error, :admin_users_limit_reached} ->
+        {:noreply, put_flash(socket, :error, "Admin user limit reached for your account")}
     end
   end
 
-  def handle_event("change_tab", %{"tab" => tab}, socket) do
-    params = Map.put(socket.assigns.query_params, "tab", tab)
+  def handle_event(
+        "change_tab",
+        %{"tab" => tab},
+        %{assigns: %{selected_actor: %Actor{} = actor}} = socket
+      ) do
+    {:noreply, push_patch(socket, to: LiveTable.live_table_path(socket, ~p"/#{socket.assigns.account}/actors/#{actor}", tab: tab))}
+  end
 
-    {:noreply,
-     push_patch(socket,
-       to: ~p"/#{socket.assigns.account}/actors/#{socket.assigns.selected_actor.id}?#{params}"
-     )}
+  def handle_event("change_tab", _params, %{assigns: %{selected_actor: nil}} = socket) do
+    {:noreply, socket}
   end
 
   def handle_event("validate_token", params, socket) do
@@ -768,7 +766,16 @@ defmodule PortalWeb.Actors do
      end)}
   end
 
-  def handle_info(%Phoenix.Socket.Broadcast{event: "presence_diff", topic: topic}, socket) do
+  # The :actors topic carries every actor type, so this page also sees service
+  # accounts and API clients, which have pages of their own. Those and user
+  # updates that leave the count alone change nothing here.
+  def handle_info(%Change{struct: %Actor{}}, socket), do: {:noreply, socket}
+  def handle_info(%Change{old_struct: %Actor{}}, socket), do: {:noreply, socket}
+
+  def handle_info(
+        %Phoenix.Socket.Broadcast{event: "presence_diff", topic: topic, payload: payload},
+        socket
+      ) do
     actor = socket.assigns.selected_actor
 
     cond do
@@ -779,7 +786,8 @@ defmodule PortalWeb.Actors do
         sessions = Database.get_portal_sessions_for_actor(actor.id, socket.assigns.subject)
         {:noreply, merge_state(socket, :actor_related, sessions: sessions)}
 
-      topic == "presences:actor_clients:" <> actor.id ->
+      topic == "presences:account_devices:" <> socket.assigns.account.id and
+          Presence.Devices.diff_includes_actor?(payload, actor.id) ->
         tokens = Database.get_client_tokens_for_actor(actor.id, socket.assigns.subject)
         {:noreply, merge_state(socket, :actor_related, tokens: tokens)}
 
@@ -862,8 +870,8 @@ defmodule PortalWeb.Actors do
         {:noreply,
          socket
          |> put_flash(:success, flash_message)
-         |> reload_live_table!("actors")
-         |> push_patch(to: ~p"/#{socket.assigns.account}/actors/#{actor.id}")}
+         |> LiveTable.reload_live_table!("actors")
+         |> push_patch(to: LiveTable.live_table_path(socket, ~p"/#{socket.assigns.account}/actors/#{actor.id}"))}
 
       {:error, changeset} ->
         {:noreply, assign(socket, actor_form: actor_form_state(to_form(changeset)))}
@@ -932,33 +940,6 @@ defmodule PortalWeb.Actors do
     end
   end
 
-  defp subscribe_client_tokens(socket, actor) do
-    if connected?(socket) and socket.assigns.client_tokens_subscribed_actor_id != actor.id do
-      if prev_id = socket.assigns.client_tokens_subscribed_actor_id do
-        Presence.Clients.Actor.unsubscribe(prev_id)
-      end
-
-      Presence.Clients.Actor.subscribe(actor.id)
-      assign(socket, client_tokens_subscribed_actor_id: actor.id)
-    else
-      socket
-    end
-  end
-
-  defp unsubscribe_client_tokens(socket) do
-    cond do
-      not connected?(socket) ->
-        socket
-
-      id = socket.assigns[:client_tokens_subscribed_actor_id] ->
-        Presence.Clients.Actor.unsubscribe(id)
-        assign(socket, client_tokens_subscribed_actor_id: nil)
-
-      true ->
-        socket
-    end
-  end
-
   defp maybe_update_actor_assign(socket, id, updated_actor) do
     if Map.get(socket.assigns, :selected_actor) && socket.assigns.selected_actor.id == id do
       assign(socket, selected_actor: updated_actor)
@@ -980,7 +961,6 @@ defmodule PortalWeb.Actors do
         |> assign(base_actor_assigns())
         |> assign(actor_panel: actor_panel, actor_related: actor_related)
         |> subscribe_portal_sessions(actor)
-        |> subscribe_client_tokens(actor)
 
       :error ->
         socket
@@ -1025,35 +1005,35 @@ defmodule PortalWeb.Actors do
   def render(assigns) do
     ~H"""
     <div class="relative flex flex-col h-full overflow-hidden">
-      <.page_header>
+      <Page.page_header>
         <:icon>
-          <.icon name="ri-user-line" class="w-16 h-16 text-brand" />
+          <Core.icon name="ri-user-line" class="w-16 h-16 text-brand" />
         </:icon>
         <:title>People</:title>
         <:description>
           Admin users and regular users in this account.
         </:description>
         <:action>
-          <.docs_action path="/deploy/users" />
+          <Navigation.docs_action path="/deploy/users" />
         </:action>
         <:action>
-          <.button style="primary" icon="ri-add-line" phx-click="open_new_actor_panel">
+          <Form.button style="primary" icon="ri-add-line" phx-click="open_new_actor_panel">
             New Person
-          </.button>
+          </Form.button>
         </:action>
         <:stats>
           <.async_result :let={count} assign={@actors_count}>
-            <:loading><.badge type="primary">Loading...</.badge></:loading>
-            <.dual_badge type="primary">
+            <:loading><Core.badge type="primary">Loading...</Core.badge></:loading>
+            <Core.dual_badge type="primary">
               <:left>{count}</:left>
               <:right>Total</:right>
-            </.dual_badge>
+            </Core.dual_badge>
           </.async_result>
         </:stats>
-      </.page_header>
+      </Page.page_header>
 
       <div class="flex-1 flex flex-col min-h-0 overflow-hidden">
-        <.live_table
+        <LiveTable.live_table
           id="actors"
           rows={@actors}
           row_id={&"actor-#{&1.id}"}
@@ -1069,7 +1049,7 @@ defmodule PortalWeb.Actors do
         >
           <:col :let={actor} field={{:actors, :name}} label="name">
             <div class="flex items-center gap-2.5">
-              <.actor_type_icon_with_badge actor={actor} />
+              <ActorComponents.actor_type_icon_with_badge actor={actor} />
               <div>
                 <div class="font-medium text-heading group-hover:text-brand transition-colors">
                   {actor.name}
@@ -1086,15 +1066,15 @@ defmodule PortalWeb.Actors do
             </span>
           </:col>
           <:col :let={actor} label="status" class="w-32">
-            <.actor_status_badge disabled_at={actor.disabled_at} />
+            <ActorComponents.actor_status_badge is_disabled={actor.is_disabled} />
           </:col>
           <:empty>
             <span class="text-sm text-subtle">No people to display.</span>
           </:empty>
-        </.live_table>
+        </LiveTable.live_table>
       </div>
 
-      <.actor_panel
+      <ActorComponents.actor_panel
         account={@account}
         actor={@selected_actor}
         query_params={@query_params}
@@ -1208,7 +1188,7 @@ defmodule PortalWeb.Actors do
         Database.remove_group_member(group_id, actor, subject)
       end)
 
-    groups = Database.get_groups_for_actor(actor.id, subject, repo: :primary)
+    groups = Database.get_groups_for_actor(actor.id, subject)
 
     errors =
       (addition_results ++ removal_results)
@@ -1276,7 +1256,7 @@ defmodule PortalWeb.Actors do
     import Portal.Repo.Query
     alias Portal.ExternalIdentity
     alias Portal.Actor
-    alias Portal.ClientSession
+    alias Portal.Device
     alias Portal.Presence
     alias Portal.Safe
     alias Portal.Directory
@@ -1304,7 +1284,7 @@ defmodule PortalWeb.Actors do
     def count_actors(subject) do
       from(a in Actor, as: :actors)
       |> where([actors: a], a.type in [:account_user, :account_admin_user])
-      |> Safe.scoped(subject, :replica)
+      |> Safe.scoped(subject)
       |> Safe.aggregate(:count)
     end
 
@@ -1368,11 +1348,11 @@ defmodule PortalWeb.Actors do
         from(d in Directory,
           where: d.account_id == ^subject.account.id,
           left_join: google in Portal.Google.Directory,
-          on: google.id == d.id and d.type == :google,
+          on: google.id == d.id and google.account_id == d.account_id and d.type == :google,
           left_join: entra in Portal.Entra.Directory,
-          on: entra.id == d.id and d.type == :entra,
+          on: entra.id == d.id and entra.account_id == d.account_id and d.type == :entra,
           left_join: okta in Portal.Okta.Directory,
-          on: okta.id == d.id and d.type == :okta,
+          on: okta.id == d.id and okta.account_id == d.account_id and d.type == :okta,
           select: %{
             id: d.id,
             name: fragment("COALESCE(?, ?, ?)", google.name, entra.name, okta.name),
@@ -1380,7 +1360,7 @@ defmodule PortalWeb.Actors do
           },
           order_by: [asc: fragment("COALESCE(?, ?, ?)", google.name, entra.name, okta.name)]
         )
-        |> Safe.scoped(subject, :replica)
+        |> Safe.scoped(subject)
         |> Safe.all()
         |> case do
           {:error, _} ->
@@ -1398,11 +1378,11 @@ defmodule PortalWeb.Actors do
     end
 
     def filter_by_status(queryable, "active") do
-      {queryable, dynamic([actors: actors], is_nil(actors.disabled_at))}
+      {queryable, dynamic([actors: actors], actors.is_disabled == false)}
     end
 
     def filter_by_status(queryable, "disabled") do
-      {queryable, dynamic([actors: actors], not is_nil(actors.disabled_at))}
+      {queryable, dynamic([actors: actors], actors.is_disabled == true)}
     end
 
     def filter_by_type(queryable, "admin") do
@@ -1459,7 +1439,7 @@ defmodule PortalWeb.Actors do
       with {:ok, paginator_opts} <- OffsetPaginator.init(__MODULE__, order_by, page_opts),
            {:ok, filtered_query} <- Filter.filter(index_query(), __MODULE__, filter),
            count when is_integer(count) <-
-             Safe.aggregate(Safe.scoped(filtered_query, subject, :replica), :count),
+             Safe.aggregate(Safe.scoped(filtered_query, subject), :count),
            actor_ids <- list_actor_ids(filtered_query, paginator_opts, subject),
            {actor_ids, metadata} <- OffsetPaginator.metadata(actor_ids, paginator_opts) do
         actors = fetch_actors_page(actor_ids, subject)
@@ -1474,7 +1454,7 @@ defmodule PortalWeb.Actors do
       filtered_query
       |> select([actors: actors], actors.id)
       |> OffsetPaginator.query(paginator_opts)
-      |> Safe.scoped(subject, :replica)
+      |> Safe.scoped(subject)
       |> Safe.all()
     end
 
@@ -1484,7 +1464,7 @@ defmodule PortalWeb.Actors do
       actors =
         all()
         |> where([actors: actors], actors.id in ^actor_ids)
-        |> Safe.scoped(subject, :replica)
+        |> Safe.scoped(subject)
         |> Safe.all()
 
       actors_by_id = Map.new(actors, &{&1.id, &1})
@@ -1496,8 +1476,8 @@ defmodule PortalWeb.Actors do
 
     def fetch_account(subject) do
       from(a in Portal.Account)
-      |> Safe.scoped(subject, :replica)
-      |> Safe.one!(fallback_to_primary: true)
+      |> Safe.scoped(subject)
+      |> Safe.one!()
     end
 
     def get_actor(id, subject) do
@@ -1505,8 +1485,8 @@ defmodule PortalWeb.Actors do
         from(a in Actor, as: :actors)
         |> where([actors: a], a.id == ^id)
         |> where([actors: a], a.type != :api_client)
-        |> Safe.scoped(subject, :replica)
-        |> Safe.one(fallback_to_primary: true)
+        |> Safe.scoped(subject)
+        |> Safe.one()
 
       case result do
         nil -> {:error, :not_found}
@@ -1518,17 +1498,20 @@ defmodule PortalWeb.Actors do
     def get_identities_for_actor(actor_id, subject) do
       from(i in ExternalIdentity, as: :identities)
       |> where([identities: i], i.actor_id == ^actor_id)
-      |> join(:left, [identities: i], d in assoc(i, :directory), as: :directory)
+      |> join(:left, [identities: i], d in assoc(i, :directory),
+        on: d.account_id == i.account_id,
+        as: :directory
+      )
       |> join(:left, [directory: d], gd in Portal.Google.Directory,
-        on: gd.id == d.id and d.type == :google,
+        on: gd.id == d.id and gd.account_id == d.account_id and d.type == :google,
         as: :google_directory
       )
       |> join(:left, [directory: d], ed in Portal.Entra.Directory,
-        on: ed.id == d.id and d.type == :entra,
+        on: ed.id == d.id and ed.account_id == d.account_id and d.type == :entra,
         as: :entra_directory
       )
       |> join(:left, [directory: d], od in Portal.Okta.Directory,
-        on: od.id == d.id and d.type == :okta,
+        on: od.id == d.id and od.account_id == d.account_id and d.type == :okta,
         as: :okta_directory
       )
       |> join(:left, [identities: i], ss in Portal.ExternalIdentitySyncState,
@@ -1549,7 +1532,7 @@ defmodule PortalWeb.Actors do
       )
       |> order_by([identities: i], desc: i.inserted_at)
       |> preload([identities: i, sync_state: ss], sync_state: ss)
-      |> Safe.scoped(subject, :replica)
+      |> Safe.scoped(subject)
       |> Safe.all()
     end
 
@@ -1558,10 +1541,10 @@ defmodule PortalWeb.Actors do
         where: a.account_id == ^account_id,
         where: a.type == :account_admin_user,
         where: a.id != ^actor_id,
-        where: is_nil(a.disabled_at)
+        where: a.is_disabled == false
       )
-      |> Safe.scoped(subject, :replica)
-      |> Safe.exists?(fallback_to_primary: true)
+      |> Safe.scoped(subject)
+      |> Safe.exists?()
     end
 
     def get_client_tokens_for_actor(actor_id, subject) do
@@ -1569,50 +1552,53 @@ defmodule PortalWeb.Actors do
         from(c in ClientToken, as: :client_tokens)
         |> where([client_tokens: c], c.actor_id == ^actor_id)
         |> order_by([client_tokens: c], desc: c.inserted_at)
-        |> Safe.scoped(subject, :replica)
+        |> Safe.scoped(subject)
         |> Safe.all()
 
       tokens
-      |> preload_latest_sessions_for_tokens(subject)
-      |> Presence.Clients.preload_client_tokens_presence()
+      |> preload_last_used_devices_for_tokens(subject)
+      |> Presence.Devices.preload_client_tokens_presence()
     end
 
-    defp preload_latest_sessions_for_tokens(tokens, subject) do
+    defp preload_last_used_devices_for_tokens(tokens, subject) do
       token_ids = Enum.map(tokens, & &1.id)
 
-      sessions_by_token_id =
-        from(s in ClientSession,
-          where: s.client_token_id in ^token_ids,
-          distinct: s.client_token_id,
-          order_by: [asc: s.client_token_id, desc: s.inserted_at]
+      devices_by_token_id =
+        from(d in Device,
+          where: d.client_token_id in ^token_ids,
+          distinct: d.client_token_id,
+          order_by: [asc: d.client_token_id, desc: d.last_seen_at]
         )
-        |> Safe.scoped(subject, :replica)
+        |> Safe.scoped(subject)
         |> Safe.all()
         |> Map.new(&{&1.client_token_id, &1})
 
       Enum.map(tokens, fn token ->
-        %{token | latest_session: Map.get(sessions_by_token_id, token.id)}
+        %{token | last_used_device: Map.get(devices_by_token_id, token.id)}
       end)
     end
 
     def get_identity_by_id(identity_id, subject) do
       from(i in ExternalIdentity, as: :identities)
       |> where([identities: i], i.id == ^identity_id)
-      |> Safe.scoped(subject, :replica)
-      |> Safe.one(fallback_to_primary: true)
+      |> Safe.scoped(subject)
+      |> Safe.one()
     end
 
     def get_client_token_by_id(token_id, subject) do
       from(c in ClientToken, as: :client_tokens)
       |> where([client_tokens: c], c.id == ^token_id)
-      |> Safe.scoped(subject, :replica)
-      |> Safe.one(fallback_to_primary: true)
+      |> Safe.scoped(subject)
+      |> Safe.one()
     end
 
     def get_portal_sessions_for_actor(actor_id, subject) do
       from(ps in PortalSession, as: :portal_sessions)
       |> where([portal_sessions: ps], ps.actor_id == ^actor_id)
-      |> join(:left, [portal_sessions: ps], ap in assoc(ps, :auth_provider), as: :auth_provider)
+      |> join(:left, [portal_sessions: ps], ap in assoc(ps, :auth_provider),
+        on: ap.account_id == ps.account_id,
+        as: :auth_provider
+      )
       |> select_merge([auth_provider: ap], %{
         auth_provider_type: type(ap.type, :string),
         auth_provider_name:
@@ -1636,7 +1622,7 @@ defmodule PortalWeb.Actors do
           )
       })
       |> order_by([portal_sessions: ps], desc: ps.inserted_at)
-      |> Safe.scoped(subject, :replica)
+      |> Safe.scoped(subject)
       |> Safe.all()
       |> Presence.PortalSessions.preload_portal_sessions_presence()
     end
@@ -1644,29 +1630,30 @@ defmodule PortalWeb.Actors do
     def get_portal_session_by_id(session_id, subject) do
       from(ps in PortalSession, as: :portal_sessions)
       |> where([portal_sessions: ps], ps.id == ^session_id)
-      |> Safe.scoped(subject, :replica)
-      |> Safe.one(fallback_to_primary: true)
+      |> Safe.scoped(subject)
+      |> Safe.one()
     end
 
-    def get_groups_for_actor(actor_id, subject, opts \\ []) do
-      repo = Keyword.get(opts, :repo, :replica)
-
+    def get_groups_for_actor(actor_id, subject) do
       from(g in Portal.Group, as: :groups)
       |> join(:inner, [groups: g], m in Portal.Membership,
         on: m.group_id == g.id and m.account_id == g.account_id,
         as: :membership
       )
-      |> join(:left, [groups: g], d in assoc(g, :directory), as: :directory)
+      |> join(:left, [groups: g], d in assoc(g, :directory),
+        on: d.account_id == g.account_id,
+        as: :directory
+      )
       |> join(:left, [directory: d], gd in Portal.Google.Directory,
-        on: gd.id == d.id and d.type == :google,
+        on: gd.id == d.id and gd.account_id == d.account_id and d.type == :google,
         as: :google_directory
       )
       |> join(:left, [directory: d], ed in Portal.Entra.Directory,
-        on: ed.id == d.id and d.type == :entra,
+        on: ed.id == d.id and ed.account_id == d.account_id and d.type == :entra,
         as: :entra_directory
       )
       |> join(:left, [directory: d], od in Portal.Okta.Directory,
-        on: od.id == d.id and d.type == :okta,
+        on: od.id == d.id and od.account_id == d.account_id and d.type == :okta,
         as: :okta_directory
       )
       |> where([membership: m], m.actor_id == ^actor_id)
@@ -1679,7 +1666,7 @@ defmodule PortalWeb.Actors do
         }
       )
       |> order_by([groups: g], asc: g.name)
-      |> Safe.scoped(subject, repo)
+      |> Safe.scoped(subject)
       |> Safe.all()
     end
 
@@ -1763,7 +1750,7 @@ defmodule PortalWeb.Actors do
         end
 
       query
-      |> Safe.scoped(subject, :replica)
+      |> Safe.scoped(subject)
       |> Safe.all()
       |> case do
         {:error, _} = err -> err
@@ -1794,7 +1781,7 @@ defmodule PortalWeb.Actors do
     defp fetch_membership(group_id, actor, subject) do
       from(m in Portal.Membership, as: :memberships)
       |> where([memberships: m], m.group_id == ^group_id and m.actor_id == ^actor.id)
-      |> Safe.scoped(subject, :replica)
+      |> Safe.scoped(subject)
       |> Safe.one()
     end
   end

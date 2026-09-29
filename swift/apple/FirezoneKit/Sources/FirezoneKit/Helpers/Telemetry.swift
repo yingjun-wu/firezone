@@ -18,7 +18,13 @@ public enum Telemetry {
     }
   }
 
-  public static func start(enableAppHangTracking: Bool = true) {
+  public static func start(enableAppHangTracking: Bool = true, enableMetricKit: Bool = false) {
+    guard !BundleHelper.noTelemetry else {
+      Log.info("Telemetry is switched off for this build")
+
+      return
+    }
+
     SentrySDK.start { options in
       options.dsn =
         "https://66c71f83675f01abfffa8eb977bcbbf7@o4507971108339712.ingest.us.sentry.io/4508175177023488"
@@ -26,7 +32,13 @@ public enum Telemetry {
       options.releaseName = releaseName()
       options.dist = distributionType()
       options.enableAppHangTracking = enableAppHangTracking
+      options.enableMetricKit = enableMetricKit
       options.enableLogs = true
+      options.beforeSend = { event in
+        retitleWithLocalizedDescription(event)
+
+        return event
+      }
     }
   }
 
@@ -55,6 +67,21 @@ public enum Telemetry {
 
   public static func capture(_ err: Error) {
     SentrySDK.capture(error: err)
+  }
+
+  // The fingerprint is pinned to domain and code because these events carry no stack trace:
+  // Sentry would otherwise group them by the localized text and split one fault per locale.
+  private static func retitleWithLocalizedDescription(_ event: Event) {
+    guard let error = event.error as NSError?,
+      let exception = event.exceptions?.first
+    else { return }
+
+    let description = error.localizedDescription
+
+    guard !description.isEmpty else { return }
+
+    exception.value = description
+    event.fingerprint = [error.domain, String(error.code)]
   }
 
   private static func distributionType() -> String {

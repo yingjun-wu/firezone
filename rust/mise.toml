@@ -5,19 +5,38 @@
 [settings]
 auto_install = false
 
-[env]
-# Match CI environment - enables tokio unstable features and denies warnings
-RUSTFLAGS = "--cfg tokio_unstable"
-
 [tools]
 "github:aya-rs/bpf-linker" = { version = "0.10.3", os = ["linux"] }
 "cargo:cargo-deb" = { version = "3.7.0", os = ["linux"] }
 "github:taiki-e/cargo-llvm-cov" = "0.6.21"
+# `matching_regex` skips the npm tarballs the release also carries, so every
+# platform gets the bare binary; `bin` gives it a name the shim can use.
+"github:getsentry/sentry-cli" = { version = "3.6.2", bin = "sentry-cli", matching_regex = "^sentry-cli-(Darwin|Linux|Windows)-" }
 "github:tauri-apps/tauri" = { version = "2.11.2", version_prefix = "tauri-cli-v" }
+
+# The eBPF program is compiled with this exact nightly toolchain: `aya_build`
+# invokes it via `rustup run` (see `relay/server/build.rs`; keep the two pins
+# in sync). Installing it is a task rather than a `rust` entry in `[tools]`
+# because the latter would activate the nightly via `RUSTUP_TOOLCHAIN`,
+# overriding `rust-toolchain.toml` for everything else in this directory.
+[tasks.install-ebpf-toolchain]
+description = "Install the nightly toolchain that the eBPF program is compiled with"
+run = "rustup toolchain install nightly-2025-05-30 --profile minimal --component rust-src"
 
 # =============================================================================
 # Individual checks (matching CI)
 # =============================================================================
+
+[tasks.workspace-crates]
+description = "List the name and directory of every crate in the workspace, as JSON"
+shell = "bash -c"
+hide = true
+run = '''
+set -euo pipefail
+
+cargo metadata --format-version=1 --no-deps |
+  jq -ce '[.packages[] | {name, dir: (.manifest_path | sub("/Cargo.toml$"; "") + "/")}]'
+'''
 
 [tasks.fmt]
 description = "Format Rust code"
@@ -46,31 +65,6 @@ run = "cargo deny check --hide-inclusion-graph --deny unnecessary-skip"
 [tasks.test]
 description = "Run tests (CI check)"
 run = "cargo test --all-features -- --include-ignored --nocapture"
-
-[tasks.tunnel-proptest]
-description = "Run the tunnel proptest suite with extended case/shrink budgets"
-dir = "libs/connlib/tunnel"
-env = { CARGO_PROFILE_TEST_OPT_LEVEL = "1", PROPTEST_CASES = "10000", PROPTEST_MAX_SHRINK_ITERS = "100" }
-raw = true
-run = "cargo test tunnel_test --features proptest -- --nocapture"
-
-[tasks.tauri-mock]
-description = "Run the GUI client for rapid UI iteration with an in-process mock Tunnel service (--mock-tunnel) and the portal decoupled (--skip-portal-auth). Self-contained: no root, no separate process."
-dir = "gui-client"
-raw = true
-run = "cargo tauri dev -- -- --skip-portal-auth --mock-tunnel"
-
-[tasks.tauri-dev]
-description = "Run the GUI client in dev against a dev tunnel service"
-dir = "gui-client"
-raw = true
-run = "cargo tauri dev -- -- --skip-tunnel-pipe-owner-check"
-
-[tasks.tunnel]
-description = "Run the Tunnel service interactively for local GUI dev. In debug builds `run-interactive` skips the LocalSystem pipe-owner check; must be run from an elevated (Administrator) shell."
-dir = "gui-client"
-raw = true
-run = "cargo run -p firezone-gui-client --bin firezone-client-tunnel -- run-interactive"
 
 # =============================================================================
 # Profiling
@@ -111,6 +105,45 @@ sudo perf stat -p "$statpids" -e task-clock,cycles,instructions,cpu-migrations,c
 wait # blocks until Ctrl-C fires the INT trap
 wait # reap the recorders once they have flushed
 echo "Done: perf-client.data${gateway:+ perf-gateway.data} perf-sched.data perf-stat.txt"
+"""
+
+[tasks.setup-perf-env]
+description = "Apply the kernel sysctls for connlib perf benchmarking (larger socket + backlog buffers)."
+raw = true
+run = """
+set -u
+
+echo "Applying kernel sysctls ..."
+sudo sysctl -w net.core.wmem_max=2097152          # 2 MB, caps connlib's UDP sndbuf
+sudo sysctl -w net.core.rmem_max=16777216         # 16 MB, caps connlib's UDP rcvbuf = the RcvbufErr we measure
+sudo sysctl -w net.core.netdev_max_backlog=100000 # matches the netem limit
+sudo sysctl -w net.core.netdev_budget=5000        # drain more per softirq poll
+
+echo "Done (persists until reboot)."
+"""
+
+[tasks.pin-cpu]
+description = "Pin every CPU core to a fixed frequency (GHz, default 2.5) so boost + thermal throttling stop confounding perf runs."
+usage = 'arg "ghz" default="2.5"'
+raw = true
+run = """
+set -u
+
+ghz="${usage_ghz:-2.5}"
+khz=$(awk -v g="$ghz" 'BEGIN{printf "%d", g*1000000}')
+
+echo "Pinning all CPUs to ${ghz} GHz (${khz} kHz)..."
+# Order-safe: drop the floor, set the ceiling, then raise the floor — works whether
+# we are raising or lowering from the current setting. Capping scaling_max disables boost.
+for p in /sys/devices/system/cpu/cpu*/cpufreq; do
+  cat "$p/cpuinfo_min_freq" | sudo tee "$p/scaling_min_freq" >/dev/null
+  echo "$khz" | sudo tee "$p/scaling_max_freq" >/dev/null
+  echo "$khz" | sudo tee "$p/scaling_min_freq" >/dev/null
+done
+
+echo "Pinned (persists until reboot). Verify the EFFECTIVE clock under load; the chip can"
+echo "still throttle below the floor: cycles / task-clock from perf stat, or:"
+echo "  grep MHz /proc/cpuinfo | sort -u"
 """
 
 # =============================================================================

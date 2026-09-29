@@ -3,6 +3,7 @@ defmodule Portal.Billing.EventHandler do
   Handles Stripe webhook events for billing and subscription management.
   """
 
+  import Ecto.Changeset
   alias Portal.Accounts
   alias Portal.Billing
   alias Portal.Billing.Stripe.ProcessedEvents
@@ -18,16 +19,33 @@ defmodule Portal.Billing.EventHandler do
   defp process_event_with_lock(event) do
     customer_id = extract_customer_id(event)
 
-    Database.with_customer_lock(customer_id, fn ->
+    result = Database.with_customer_lock(customer_id, fn ->
       process_event(event, customer_id)
     end)
+
+    # Dispatch only after the billing transaction has committed.
+    case result do
+      {:ok, {processed_event, %Portal.Account{} = account}} ->
+        Portal.Analytics.subscription_created(
+          account,
+          get_in(event, ["data", "object", "id"]),
+          event["created"]
+        )
+        {:ok, processed_event}
+
+      {:ok, {processed_event, nil}} -> {:ok, processed_event}
+      other -> other
+    end
   end
 
   defp process_event(event, customer_id) do
     with :ok <- check_event_processing_eligibility(event, customer_id),
+         previous_account = Database.account_by_customer_id(customer_id),
          :ok <- process_event_by_type(event),
          :ok <- record_processed_event(event, customer_id) do
-      {:ok, event}
+      account = Database.account_by_customer_id(customer_id)
+      conversion = if team_enrollment?(event, previous_account, account), do: account
+      {:ok, {event, conversion}}
     else
       {:skip, reason} ->
         Logger.info("Skipping stripe event", reason: inspect(reason))
@@ -41,6 +59,17 @@ defmodule Portal.Billing.EventHandler do
 
         {:error, reason}
     end
+  end
+
+  defp team_enrollment?(event, previous_account, account) do
+    event["type"] in ["customer.subscription.created", "customer.subscription.updated"] and
+      get_in(event, ["data", "object", "status"]) == "active" and
+      is_nil(get_in(event, ["data", "object", "pause_collection"])) and
+      not is_nil(previous_account) and not is_nil(account) and
+      Billing.plan_type(account) == :team and
+      (Billing.plan_type(previous_account) != :team or
+         not is_nil(previous_account.metadata.stripe.trial_ends_at) or
+         previous_account.metadata.stripe.subscription_status in ["trialing", "incomplete", "incomplete_expired"])
   end
 
   defp check_event_processing_eligibility(event, customer_id) do
@@ -185,7 +214,7 @@ defmodule Portal.Billing.EventHandler do
     %{"id" => customer_id} = customer_data
 
     disable_account_attrs = %{
-      disabled_at: DateTime.utc_now(),
+      is_disabled: true,
       disabled_reason: "Stripe customer deleted"
     }
 
@@ -197,7 +226,7 @@ defmodule Portal.Billing.EventHandler do
     customer_id = Map.get(subscription_data, "customer")
 
     disable_account_attrs = %{
-      disabled_at: DateTime.utc_now(),
+      is_disabled: true,
       disabled_reason: "Stripe subscription deleted"
     }
 
@@ -208,7 +237,7 @@ defmodule Portal.Billing.EventHandler do
     customer_id = Map.get(subscription_data, "customer")
 
     disable_account_attrs = %{
-      disabled_at: DateTime.utc_now(),
+      is_disabled: true,
       disabled_reason: "Stripe subscription paused"
     }
 
@@ -274,6 +303,7 @@ defmodule Portal.Billing.EventHandler do
 
       stripe_metadata = %{
         "subscription_id" => subscription_id,
+        "subscription_status" => status,
         "product_name" => product_name,
         "trial_ends_at" => if(subscription_trialing?, do: DateTime.from_unix!(trial_end))
       }
@@ -285,7 +315,7 @@ defmodule Portal.Billing.EventHandler do
           subscription_metadata,
           stripe_metadata
         )
-        |> Map.put(:disabled_at, nil)
+        |> Map.put(:is_disabled, false)
         |> Map.put(:disabled_reason, nil)
 
       {:ok, attrs}
@@ -491,9 +521,16 @@ defmodule Portal.Billing.EventHandler do
     {:ok, internet_site} = Database.insert_site(changeset)
     changeset = create_internet_resource_changeset(account, internet_site)
     {:ok, _resource} = Database.insert(changeset)
+    changeset = create_account_owner_group_changeset(account)
+    {:ok, account_owner_group} = Database.insert(changeset)
+    changeset = create_self_device_pool_changeset(account)
+    {:ok, self_device_pool} = Database.insert(changeset)
+    changeset = create_self_device_pool_policy_changeset(account_owner_group, self_device_pool)
+    {:ok, _policy} = Database.insert(changeset)
 
     # Create email provider
     {:ok, _email_provider} = Database.create_email_provider(account)
+    {:ok, _x509_provider} = Database.create_x509_provider(account)
 
     # Create admin user
     email = metadata["account_admin_email"] || account_email
@@ -501,7 +538,10 @@ defmodule Portal.Billing.EventHandler do
     family_name = metadata["account_owner_last_name"]
     name = "#{given_name} #{family_name}"
     changeset = create_admin_changeset(account, email, name)
-    {:ok, _actor} = Database.insert(changeset)
+    {:ok, actor} = Database.insert(changeset)
+
+    changeset = create_account_owner_membership_changeset(account_owner_group, actor)
+    {:ok, _membership} = Database.insert(changeset)
 
     :ok
   end
@@ -510,6 +550,22 @@ defmodule Portal.Billing.EventHandler do
     import Ecto.Changeset
     attrs = %{account_id: account.id, name: "Everyone", type: :managed}
     cast(%Portal.Group{}, attrs, ~w[account_id name type]a)
+  end
+
+  defp create_account_owner_group_changeset(account) do
+    import Ecto.Changeset
+
+    %Portal.Group{account_id: account.id}
+    |> cast(Portal.Group.account_owner_attrs(), [:name, :type])
+    |> Portal.Group.changeset()
+  end
+
+  defp create_account_owner_membership_changeset(account_owner_group, actor) do
+    import Ecto.Changeset
+
+    %Portal.Membership{account_id: account_owner_group.account_id}
+    |> cast(%{group_id: account_owner_group.id, actor_id: actor.id}, [:group_id, :actor_id])
+    |> Portal.Membership.changeset()
   end
 
   defp create_admin_changeset(account, email, name) do
@@ -566,6 +622,27 @@ defmodule Portal.Billing.EventHandler do
     |> validate_required([:name, :type])
   end
 
+  defp create_self_device_pool_changeset(account) do
+    %Portal.Resource{account_id: account.id}
+    |> cast(Portal.Resource.self_device_pool_attrs(), [:type, :device_membership_criteria, :name])
+    |> validate_required([:type, :device_membership_criteria, :name])
+    |> Portal.Resource.changeset()
+  end
+
+  defp create_self_device_pool_policy_changeset(account_owner_group, self_device_pool) do
+    %Portal.Policy{account_id: account_owner_group.account_id}
+    |> cast(
+      %{
+        group_id: account_owner_group.id,
+        resource_id: self_device_pool.id,
+        description: "Lets the account owner reach their own devices."
+      },
+      [:group_id, :resource_id, :description]
+    )
+    |> validate_required([:group_id, :resource_id])
+    |> Portal.Policy.changeset()
+  end
+
   # Account Updates
   defp update_account_by_stripe_customer_id(customer_id, attrs) do
     with {:ok, account_id} <- Billing.fetch_customer_account_id(customer_id) do
@@ -592,7 +669,10 @@ defmodule Portal.Billing.EventHandler do
     {limits, params} = Map.split(params, limit_fields)
     {features, _} = Map.split(params, feature_fields)
 
-    limits = Map.merge(limits, %{"users_count" => users_count})
+    limits =
+      limits
+      |> Map.put("users_count", users_count)
+      |> put_seat_limit(Billing.plan_type(stripe_metadata["product_name"]), seats)
 
     %{
       features: features,
@@ -600,6 +680,14 @@ defmodule Portal.Billing.EventHandler do
       metadata: %{stripe: Map.merge(metadata, stripe_metadata)}
     }
   end
+
+  # Enterprise seats are sold as monthly active users, so the limit comes from
+  # the subscription quantity and never from the Stripe metadata.
+  defp put_seat_limit(limits, :enterprise, seats),
+    do: Map.put(limits, "monthly_active_users_count", seats)
+
+  defp put_seat_limit(limits, _plan_type, _seats),
+    do: Map.delete(limits, "monthly_active_users_count")
 
   defp parse_metadata_params(metadata, limit_fields, metadata_fields) do
     metadata
@@ -652,8 +740,17 @@ defmodule Portal.Billing.EventHandler do
       Account,
       AuthProvider,
       EmailOTP,
-      Safe
+      Safe,
+      X509
     }
+
+    def account_by_customer_id(customer_id) do
+      from(a in Account,
+        where: fragment("?->'stripe'->>'customer_id' = ?", a.metadata, ^customer_id)
+      )
+      |> Safe.unscoped()
+      |> Safe.one()
+    end
 
     def with_customer_lock(customer_id, fun) do
       hashed_id = :erlang.phash2(customer_id)
@@ -666,7 +763,7 @@ defmodule Portal.Billing.EventHandler do
 
     def slug_exists?(slug) do
       from(a in Portal.Account, where: a.slug == ^slug)
-      |> Safe.unscoped(:replica)
+      |> Safe.unscoped()
       |> Safe.exists?()
     end
 
@@ -684,6 +781,42 @@ defmodule Portal.Billing.EventHandler do
       with {:ok, _auth_provider} <- Safe.unscoped(auth_provider) |> Safe.insert(),
            {:ok, email_provider} <- Safe.unscoped(email_otp_provider) |> Safe.insert() do
         {:ok, email_provider}
+      end
+    end
+
+    # OTP 28 dialyzer is stricter about opaque types (MapSet) inside Ecto.Multi
+    @dialyzer {:no_opaque, create_x509_provider: 1}
+    def create_x509_provider(account) do
+      id = Ecto.UUID.generate()
+
+      parent_changeset =
+        cast(
+          %AuthProvider{},
+          %{account_id: account.id, id: id, type: :x509},
+          ~w[id account_id type]a
+        )
+
+      x509_changeset =
+        %X509.AuthProvider{}
+        |> cast(
+          %{
+            id: id,
+            account_id: account.id,
+            name: "X.509",
+            context: :clients_only,
+            is_disabled: true
+          },
+          ~w[id account_id name context is_disabled]a
+        )
+        |> X509.AuthProvider.changeset()
+
+      Ecto.Multi.new()
+      |> Ecto.Multi.insert(:auth_provider, parent_changeset)
+      |> Ecto.Multi.insert(:x509_provider, x509_changeset)
+      |> Safe.transact()
+      |> case do
+        {:ok, %{x509_provider: provider}} -> {:ok, provider}
+        {:error, _step, changeset, _changes} -> {:error, changeset}
       end
     end
 
@@ -721,7 +854,7 @@ defmodule Portal.Billing.EventHandler do
       |> case do
         %Account{} = account ->
           account
-          |> cast(attrs, [:name, :legal_name, :slug, :disabled_at, :disabled_reason])
+          |> cast(attrs, [:name, :legal_name, :slug, :is_disabled, :disabled_reason])
           |> cast_embed(:limits)
           |> cast_embed(:features)
           |> cast_embed(:metadata)

@@ -30,7 +30,7 @@ defmodule Portal.Workers.CheckAccountLimits do
   end
 
   defp process_accounts_in_batches(cursor) do
-    case Database.fetch_active_accounts_batch(cursor, @batch_size) do
+    case Database.fetch_enabled_accounts_batch(cursor, @batch_size) do
       [] ->
         :ok
 
@@ -119,9 +119,19 @@ defmodule Portal.Workers.CheckAccountLimits do
     |> Map.put(:warning_last_sent_at, nil)
   end
 
-  defp should_send_email?(%{warning_last_sent_at: nil}), do: true
+  # Dormancy is checked last so the reminder clock only starts once there is
+  # somebody to remind.
+  defp should_send_email?(account) do
+    due_for_email?(account) and not dormant?(account)
+  end
 
-  defp should_send_email?(%{warning_last_sent_at: last_sent_at}) do
+  defp dormant?(account) do
+    not Billing.paid_plan?(account) and not Database.account_active?(account.id)
+  end
+
+  defp due_for_email?(%{warning_last_sent_at: nil}), do: true
+
+  defp due_for_email?(%{warning_last_sent_at: last_sent_at}) do
     days_since_last_email = DateTime.diff(DateTime.utc_now(), last_sent_at, :day)
     days_since_last_email >= @email_reminder_interval_days
   end
@@ -221,14 +231,14 @@ defmodule Portal.Workers.CheckAccountLimits do
       end)
     end
 
-    def fetch_active_accounts_batch(cursor, limit) do
+    def fetch_enabled_accounts_batch(cursor, limit) do
       from(a in Account,
-        where: is_nil(a.disabled_at),
+        where: a.is_disabled == false,
         order_by: [asc: a.id],
         limit: ^limit
       )
       |> maybe_after_cursor(cursor)
-      |> Safe.unscoped(:replica)
+      |> Safe.unscoped()
       |> Safe.all()
     end
 
@@ -245,12 +255,12 @@ defmodule Portal.Workers.CheckAccountLimits do
     defp count_users_by_account(account_ids) do
       from(a in Actor,
         where: a.account_id in ^account_ids,
-        where: is_nil(a.disabled_at),
+        where: a.is_disabled == false,
         where: a.type in [:account_admin_user, :account_user],
         group_by: a.account_id,
         select: {a.account_id, count(a.id)}
       )
-      |> Safe.unscoped(:replica)
+      |> Safe.unscoped()
       |> Safe.all()
       |> Map.new()
     end
@@ -258,12 +268,12 @@ defmodule Portal.Workers.CheckAccountLimits do
     defp count_service_accounts_by_account(account_ids) do
       from(a in Actor,
         where: a.account_id in ^account_ids,
-        where: is_nil(a.disabled_at),
+        where: a.is_disabled == false,
         where: a.type == :service_account,
         group_by: a.account_id,
         select: {a.account_id, count(a.id)}
       )
-      |> Safe.unscoped(:replica)
+      |> Safe.unscoped()
       |> Safe.all()
       |> Map.new()
     end
@@ -271,44 +281,30 @@ defmodule Portal.Workers.CheckAccountLimits do
     defp count_admins_by_account(account_ids) do
       from(a in Actor,
         where: a.account_id in ^account_ids,
-        where: is_nil(a.disabled_at),
+        where: a.is_disabled == false,
         where: a.type == :account_admin_user,
         group_by: a.account_id,
         select: {a.account_id, count(a.id)}
       )
-      |> Safe.unscoped(:replica)
+      |> Safe.unscoped()
       |> Safe.all()
       |> Map.new()
     end
 
     defp count_1m_active_users_by_account(account_ids) do
-      from(c in Device, as: :clients)
-      |> where([clients: c], c.type == :client)
-      |> where([clients: c], c.account_id in ^account_ids)
-      |> join(:inner, [clients: c], a in Actor,
-        on: c.actor_id == a.id and c.account_id == a.account_id,
+      from(d in Device, as: :devices)
+      |> where([devices: d], d.type == :client)
+      |> where([devices: d], d.account_id in ^account_ids)
+      |> join(:inner, [devices: d], a in Actor,
+        on: d.actor_id == a.id and d.account_id == a.account_id,
         as: :actor
       )
-      |> where([actor: a], is_nil(a.disabled_at))
+      |> where([actor: a], a.is_disabled == false)
       |> where([actor: a], a.type in [:account_user, :account_admin_user])
-      |> join(
-        :inner_lateral,
-        [clients: c],
-        s in subquery(
-          from(s in Portal.ClientSession,
-            where: s.device_id == parent_as(:clients).id,
-            where: s.account_id == parent_as(:clients).account_id,
-            where: s.inserted_at > ago(1, "month"),
-            select: s.id,
-            limit: 1
-          )
-        ),
-        on: true,
-        as: :recent_session
-      )
-      |> group_by([clients: c], c.account_id)
-      |> select([clients: c], {c.account_id, count(c.actor_id, :distinct)})
-      |> Safe.unscoped(:replica)
+      |> where([devices: d], d.last_seen_at > ago(1, "month"))
+      |> group_by([devices: d], d.account_id)
+      |> select([devices: d], {d.account_id, count(d.actor_id, :distinct)})
+      |> Safe.unscoped()
       |> Safe.all()
       |> Map.new()
     end
@@ -320,7 +316,7 @@ defmodule Portal.Workers.CheckAccountLimits do
         group_by: g.account_id,
         select: {g.account_id, count(g.id)}
       )
-      |> Safe.unscoped(:replica)
+      |> Safe.unscoped()
       |> Safe.all()
       |> Map.new()
     end
@@ -329,10 +325,16 @@ defmodule Portal.Workers.CheckAccountLimits do
       from(a in Actor,
         where: a.account_id == ^account_id,
         where: a.type == :account_admin_user,
-        where: is_nil(a.disabled_at)
+        where: a.is_disabled == false
       )
-      |> Safe.unscoped(:replica)
+      |> Safe.unscoped()
       |> Safe.all()
+    end
+
+    def account_active?(account_id) do
+      from(sl in Portal.SessionLog, where: sl.account_id == ^account_id)
+      |> Safe.unscoped()
+      |> Safe.exists?()
     end
   end
 end

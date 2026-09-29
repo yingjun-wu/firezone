@@ -312,11 +312,7 @@
     public static func showSignedOutAlert(_ message: String?) async -> Bool {
       let alert = NSAlert()
       alert.messageText = "Your Firezone session has ended"
-      alert.informativeText = """
-        Please sign in again to reconnect.
-
-        \(message ?? "")
-        """
+      alert.informativeText = message ?? "Please sign in again to reconnect."
       alert.addButton(withTitle: "Sign In")
       alert.addButton(withTitle: "Cancel")
       NSApp.activate(ignoringOtherApps: true)
@@ -325,15 +321,33 @@
       return response == .alertFirstButtonReturn
     }
 
+    /// Tells the user that only a restart can finish the update.
+    ///
+    /// Returns without waiting for the user, so callers don't stall behind the alert.
+    public static func showRestartRequiredAlert() {
+      let alert = NSAlert()
+      alert.messageText = "Your Mac needs to be restarted to complete the Firezone update"
+      alert.informativeText =
+        "macOS finishes updating the Firezone system extension the next time your Mac starts up."
+      alert.addButton(withTitle: "OK")
+      NSApp.activate(ignoringOtherApps: true)
+
+      show(alert)
+    }
+
     /// Shows a disconnected alert explaining why Firezone disconnected.
     public static func showDisconnectedAlert(_ message: String?) async {
       let alert = NSAlert()
       alert.messageText = "Firezone disconnected"
-      alert.informativeText = message ?? "Firezone has been disconnected."
+      alert.informativeText = disconnectedText(message)
       alert.addButton(withTitle: "OK")
       NSApp.activate(ignoringOtherApps: true)
 
       _ = await show(alert)
+    }
+
+    static func disconnectedText(_ message: String?) -> String {
+      message ?? "Firezone has been disconnected."
     }
   }
 

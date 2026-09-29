@@ -124,6 +124,36 @@ defmodule PortalAPI.SiteControllerTest do
 
       assert MapSet.subset?(data_ids, site_ids)
     end
+
+    test "filters by exact name match", %{conn: conn, account: account, actor: actor} do
+      site = site_fixture(account: account, name: "vpc-us-east")
+      _other = site_fixture(account: account, name: "vpc-us-west")
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> get("/sites", name: "vpc-us-east")
+
+      assert %{"data" => [data]} = json_response(conn, 200)
+      assert data["id"] == site.id
+    end
+
+    test "returns an empty list when no site matches the name filter", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      site_fixture(account: account, name: "vpc-us-east")
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> get("/sites", name: "does-not-exist")
+
+      assert %{"data" => []} = json_response(conn, 200)
+    end
   end
 
   describe "show/2" do
@@ -175,6 +205,17 @@ defmodule PortalAPI.SiteControllerTest do
     test "returns error when not authorized", %{conn: conn} do
       conn = post(conn, "/sites", %{})
       assert %{"type" => "about:blank", "status" => 401, "title" => "Unauthorized"} = json_response(conn, 401)
+    end
+
+    test "returns bad request for a body that is not JSON", %{conn: conn, actor: actor} do
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> post("/sites", "{not json")
+
+      assert %{"type" => "about:blank", "status" => 400, "title" => "Bad Request"} =
+               json_response(conn, 400)
     end
 
     test "returns error on empty params/body", %{conn: conn, actor: actor} do

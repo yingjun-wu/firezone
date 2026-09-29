@@ -89,20 +89,7 @@ feature-depth = 1
 # A list of advisory IDs to ignore. Note that ignored advisories will still
 # output a note when they are encountered.
 ignore = [
-    "RUSTSEC-2020-0095", # `difference` is unmaintained
     "RUSTSEC-2024-0370", # `proc-macro-error` is unmaintained
-
-    # `gtk-rs` crates are unmaintained
-    "RUSTSEC-2024-0411",
-    "RUSTSEC-2024-0412",
-    "RUSTSEC-2024-0413",
-    "RUSTSEC-2024-0414",
-    "RUSTSEC-2024-0415",
-    "RUSTSEC-2024-0416",
-    "RUSTSEC-2024-0417",
-    "RUSTSEC-2024-0418",
-    "RUSTSEC-2024-0419",
-    "RUSTSEC-2024-0420",
 
     "RUSTSEC-2024-0436", # paste, See #8387
 
@@ -112,6 +99,11 @@ ignore = [
     "RUSTSEC-2025-0081",
     "RUSTSEC-2025-0098",
     "RUSTSEC-2025-0100",
+
+    # `quick_xml` is coming in via `tauri-winrt-notification` and `tauri-utils` -> `plist`.
+    # `tauri-winrt-notification` only uses the `escape` module and `plist` is apparently also not affected (https://github.com/ebarnard/rust-plist/issues/190)
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
 
     #"RUSTSEC-0000-0000",
     #{ id = "RUSTSEC-0000-0000", reason = "you can specify a reason the advisory is ignored" },
@@ -262,26 +254,24 @@ skip = [
     "cpufeatures", # Same root cause as `chacha20` — pulled in via chacha20 0.10 from hickory 0.26.
     "crypto-common", # See `block-buffer`: pulled by boringtun 0.7's RC crypto crates (0.2 vs 0.1 elsewhere).
     "digest", # See `block-buffer`: pulled by boringtun 0.7's RC crypto crates (0.11 vs 0.10 elsewhere).
-    "foldhash",
     "getrandom",
     "hashbrown",
     "heck",
     "hmac", # See `block-buffer`: pulled by boringtun 0.7's RC crypto crates (0.13 vs 0.12 elsewhere).
     "indexmap",
+    "itertools", # ingot-macros 0.2 uses itertools 0.15; our crates are on 0.14. Build-time only, as ingot-macros is a proc-macro.
     "jni", # hickory 0.26 uses jni 0.22 for Android DNS; tauri/tao/wry/rustls-platform-verifier/ndk still on 0.21. not a problem as they land in different binaries (Android client vs gateway)
     "jni-sys",
     "libloading",
-    "linux-raw-sys",
     "nix",
     "nom",
     "object",
     "png",
     "proc-macro-crate",
-    "quick-xml",
     "rand",
     "rand_core",
-    "rustix",
     "serde_spanned",
+    "sha2", # workspace is on 0.11; tauri (tauri-codegen, wry) and dbus-secret-service still pull 0.10.
     "syn",
     "thiserror",
     "thiserror-impl",
@@ -289,6 +279,7 @@ skip = [
     "toml_datetime",
     "toml_edit",
     "webpki-roots",
+    "which", # native-dialog 0.9 is still on which 7; aya-build and the workspace are on 8.
     "windows-link",
     "windows-result",
     "windows-strings",

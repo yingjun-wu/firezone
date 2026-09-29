@@ -10,8 +10,7 @@ use anyhow::{Context as _, ErrorExt, Result, bail};
 use clap::{Args, Parser};
 use controller::Failure;
 use firezone_gui_client::{controller, deep_link, dialog, elevation, gui, logging};
-use telemetry::Telemetry;
-use tokio::{runtime::Runtime, sync::Mutex};
+use tokio::runtime::Runtime;
 use tracing::subscriber::DefaultGuard;
 
 #[expect(
@@ -27,6 +26,9 @@ enum LogGuard {
 }
 
 fn main() -> ExitCode {
+    #[cfg(all(target_os = "windows", not(debug_assertions)))]
+    attach_parent_console();
+
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("Failed to install default crypto provider");
@@ -38,24 +40,21 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let rt = tokio::runtime::Runtime::new().expect("failed to build runtime");
 
-    let mut telemetry = if cli.is_telemetry_allowed() {
-        Telemetry::new(Arc::new(socket_factory::tcp), Arc::new(socket_factory::udp))
-    } else {
-        Telemetry::disabled()
-    };
+    if cli.is_telemetry_allowed() {
+        telemetry::configure(Arc::new(socket_factory::tcp));
 
-    // Start telemetry in `entrypoint` mode so that crashes during settings
-    // load, Tauri setup, IPC connect, or the Hello-wait window are captured.
-    // The controller re-targets it at the real environment once `Hello`
-    // arrives; `main` keeps ownership so we can flush on every exit path.
-    telemetry.start(
-        "entrypoint",
-        firezone_gui_client::RELEASE,
-        telemetry::GUI_DSN,
-    );
-    let telemetry = Arc::new(Mutex::new(telemetry));
+        // Start telemetry in `entrypoint` mode so that crashes during settings
+        // load, Tauri setup, IPC connect, or the Hello-wait window are captured.
+        // The controller re-targets it at the real environment once `Hello`
+        // arrives; we flush on every exit path below.
+        telemetry::start(
+            "entrypoint",
+            firezone_gui_client::RELEASE,
+            telemetry::GUI_DSN,
+        );
+    }
 
-    let result = try_main(cli, &rt, &mut log_guard, Arc::clone(&telemetry));
+    let result = try_main(cli, &rt, &mut log_guard);
 
     let exit_code = match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -65,20 +64,36 @@ fn main() -> ExitCode {
         }
     };
 
-    rt.block_on(async { telemetry.lock().await.stop().await });
+    telemetry::stop();
 
     exit_code
 }
 
-fn try_main(
-    cli: Cli,
-    rt: &Runtime,
-    log_guard: &mut Option<LogGuard>,
-    telemetry: Arc<Mutex<Telemetry>>,
-) -> Result<()> {
+/// Attaches to the console of the parent process so subcommand output and the stdout log layer are visible when launched from a terminal.
+///
+/// Must run before the logger is set up because ANSI detection inspects stdout.
+/// Skipped when stdout is already usable (e.g. redirected to a pipe or file) because attaching would replace the inherited handles with the console.
+/// Failure means there is no parent console (e.g. launched from the Start menu), which is the normal GUI launch.
+#[cfg(all(target_os = "windows", not(debug_assertions)))]
+fn attach_parent_console() {
+    use windows::Win32::System::Console::{
+        ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_OUTPUT_HANDLE,
+    };
+
+    // SAFETY: `GetStdHandle` and `AttachConsole` have no memory-safety preconditions.
+    unsafe {
+        if GetStdHandle(STD_OUTPUT_HANDLE).is_ok_and(|h| !h.is_invalid()) {
+            return;
+        }
+
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
+fn try_main(cli: Cli, rt: &Runtime, log_guard: &mut Option<LogGuard>) -> Result<()> {
     #[cfg(debug_assertions)]
-    if cli.skip_tunnel_pipe_owner_check {
-        firezone_gui_client::ipc::skip_tunnel_pipe_owner_check();
+    if cli.skip_peer_verification {
+        client_ipc::skip_peer_verification();
     }
 
     #[cfg(debug_assertions)]
@@ -112,8 +127,8 @@ fn try_main(
     // owned by the privileged Tunnel service and arrive over the `Hello` IPC
     // message. Telemetry stays in `entrypoint` mode (started in `main`) and the
     // log filter is `RUST_LOG` or a hardcoded `info` until then; once `Hello`
-    // lands the controller re-applies the effective log filter and sends the
-    // real environment to the service via `StartTelemetry`.
+    // lands the controller re-applies the effective log filter and re-points
+    // telemetry at the effective API URL.
     let log_filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_owned());
 
     *log_guard = None;
@@ -142,24 +157,30 @@ fn try_main(
         }
 
         // All commands below _don't_ end up running the GUI because they return early.
-        Some(Cmd::Debug {
-            command: DebugCommand::Replicate6791,
-        }) => {
+        Some(Cmd::Replicate6791) => {
             firezone_gui_client::auth::replicate_6791()?;
 
             return Ok(());
         }
-        Some(Cmd::Debug {
-            command: DebugCommand::SetAutostart(SetAutostartArgs { enabled }),
-        }) => {
+        Some(Cmd::SetAutostart(SetAutostartArgs { enabled })) => {
             rt.block_on(firezone_gui_client::gui::set_autostart(enabled))?;
 
             return Ok(());
         }
-        Some(Cmd::Debug {
-            command: DebugCommand::SingleInstance,
-        }) => {
+        Some(Cmd::SingleInstance) => {
             rt.block_on(debug_single_instance())?;
+
+            return Ok(());
+        }
+        Some(Cmd::OpenTrayMenu) => {
+            rt.block_on(gui::send_and_await_ack(gui_ipc::ClientMsg::OpenTrayMenu))
+                .context("Failed to open the running instance's tray menu")?;
+
+            return Ok(());
+        }
+        Some(Cmd::CloseTrayMenu) => {
+            rt.block_on(gui::send_and_await_ack(gui_ipc::ClientMsg::CloseTrayMenu))
+                .context("Failed to close the running instance's tray menu")?;
 
             return Ok(());
         }
@@ -173,7 +194,7 @@ fn try_main(
         }
         Some(Cmd::SmokeTest) => {
             // Can't check elevation here because the Windows CI is always elevated
-            gui::run(rt, config, reloader, telemetry)?;
+            gui::run(rt, config, reloader)?;
 
             return Ok(());
         }
@@ -181,7 +202,7 @@ fn try_main(
 
     // Happy-path: Run the GUI.
 
-    match gui::run(rt, config, reloader, telemetry) {
+    match gui::run(rt, config, reloader) {
         Ok(()) => {}
         Err(anyhow) => {
             if cli.no_error_dialog {
@@ -217,7 +238,7 @@ fn try_main(
                 return Err(anyhow);
             }
 
-            if anyhow.any_is::<firezone_gui_client::ipc::WrongUser>() {
+            if anyhow.any_is::<client_ipc::WrongUser>() {
                 dialog::error(
                     "Firezone is already running in another logon session. \
                      Sign out of that session first, then try again.",
@@ -232,7 +253,7 @@ fn try_main(
                 return Err(anyhow);
             }
 
-            if anyhow.any_is::<firezone_gui_client::ipc::NotFound>() {
+            if anyhow.any_is::<client_ipc::NotFound>() {
                 dialog::error("Couldn't find Firezone Tunnel service. Is the service running?")?;
                 return Err(anyhow);
             }
@@ -314,12 +335,12 @@ struct Cli {
     )]
     no_telemetry: bool,
 
-    /// Windows-only smoke-test escape hatch: skip the LocalSystem owner check
-    /// on the Tunnel named pipe. Only exists in debug builds, so release
-    /// binaries can't disable the check.
+    /// Skip verifying the identity of the Tunnel service we connect to (the
+    /// pipe owner on Windows). Local-dev / smoke-test escape hatch. Only exists
+    /// in debug builds, so release binaries can't disable the check.
     #[cfg(debug_assertions)]
     #[arg(long, hide = true)]
-    skip_tunnel_pipe_owner_check: bool,
+    skip_peer_verification: bool,
 
     /// Decouple sign-in from the portal: mint a fake session/token on the fly
     /// (never persisted) instead of opening the browser. Pairs with
@@ -354,25 +375,18 @@ impl Cli {
     }
 
     fn is_telemetry_allowed(&self) -> bool {
-        !self.no_telemetry
+        !self.no_telemetry && !firezone_gui_client::NO_TELEMETRY
     }
 }
 
 #[derive(clap::Subcommand)]
 enum Cmd {
-    Debug {
-        #[command(subcommand)]
-        command: DebugCommand,
-    },
-    Elevated,
     OpenDeepLink(DeepLink),
-    /// SmokeTest gets its own subcommand for historical reasons.
-    SmokeTest,
-}
-
-#[derive(clap::Subcommand)]
-enum DebugCommand {
+    #[command(hide = true)]
+    Elevated,
+    #[command(hide = true)]
     Replicate6791,
+    #[command(hide = true)]
     SetAutostart(SetAutostartArgs),
     /// Drive only the launch-lock + GUI IPC handshake — no controller, no
     /// auth, no tunnel-service IPC, no Tauri UI. Two invocations exercise
@@ -383,7 +397,14 @@ enum DebugCommand {
     /// - Second invocation: sees the lock held, connects to the pipe,
     ///   sends `NewInstance`, awaits the `Ack`, prints
     ///   `second-instance: …`, and exits.
+    #[command(hide = true)]
     SingleInstance,
+    #[command(hide = true)]
+    SmokeTest,
+    #[command(hide = true)]
+    OpenTrayMenu,
+    #[command(hide = true)]
+    CloseTrayMenu,
 }
 
 #[derive(clap::Parser)]

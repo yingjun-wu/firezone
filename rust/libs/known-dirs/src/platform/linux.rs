@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 /// Path for Tunnel service config that the Tunnel service can write
 ///
-/// All writes should use `atomicwrites`.
+/// All writes should use `atomicfs`.
 ///
 /// On Linux, `/var/lib/$BUNDLE_ID/config/firezone-id`
 ///
@@ -23,6 +23,16 @@ pub fn tunnel_service_config() -> Option<PathBuf> {
 pub fn tunnel_service_logs() -> Option<PathBuf> {
     // TODO: This is magic, it must match the systemd file
     Some(PathBuf::from("/var/log").join(BUNDLE_ID))
+}
+
+/// Spool directory for flow logs the Tunnel service writes and uploads.
+///
+/// A sibling of [`tunnel_service_config`] (host-specific state that persists across
+/// reboots, not user-facing), kept out of the log directory so an exported log
+/// bundle never sweeps it up. On Linux, `/var/lib/$BUNDLE_ID/flow_logs`.
+#[expect(clippy::unnecessary_wraps)] // Signature must match Windows
+pub fn flow_logs() -> Option<PathBuf> {
+    Some(PathBuf::from("/var/lib").join(BUNDLE_ID).join("flow_logs"))
 }
 
 /// e.g. `/home/alice/.cache/dev.firezone.client/data/logs`

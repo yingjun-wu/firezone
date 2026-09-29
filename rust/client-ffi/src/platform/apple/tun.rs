@@ -1,10 +1,5 @@
-use ip_packet::IpPacket;
 use libc::{F_GETFL, F_SETFL, O_NONBLOCK, fcntl};
 use std::{io, os::fd::RawFd};
-use telemetry::otel;
-use tokio::sync::mpsc;
-
-const QUEUE_SIZE: usize = 10_000;
 
 /// Receive buffer we request for the utun control socket via `SO_RCVBUF`.
 ///
@@ -33,17 +28,21 @@ const UTUN_OPT_MAX_PENDING_PACKETS: libc::c_int = 16;
 
 pub struct Tun {
     name: String,
-    outbound_tx: mpsc::Sender<IpPacket>,
-    inbound_rx: mpsc::Receiver<IpPacket>,
+    outbound_tx: tun::OutboundTx,
+    inbound_rx: tun::InboundRx,
+}
+
+/// Finds the `utun` descriptor the NetworkExtension opened for this process.
+///
+/// Separate from [`Tun::from_fd`] so a caller can establish that the descriptor
+/// exists before committing any resources to the session that will own it. Leaves
+/// the descriptor untouched: it belongs to the NetworkExtension, and a caller that
+/// gets this far may still give up before there is a [`Tun`] to own it.
+pub fn search_fd() -> io::Result<RawFd> {
+    search_for_tun_fd()
 }
 
 impl Tun {
-    pub fn new(runtime: &tokio::runtime::Handle) -> io::Result<Self> {
-        let fd = search_for_tun_fd()?;
-        set_non_blocking(fd)?;
-        Self::from_fd_inner(fd, runtime)
-    }
-
     /// Create a new [`Tun`] from a raw file descriptor.
     ///
     /// # Safety
@@ -62,21 +61,21 @@ impl Tun {
         raise_recv_buffer(fd);
         raise_max_pending_packets(fd);
 
-        let (inbound_tx, inbound_rx) = mpsc::channel(QUEUE_SIZE);
-        let (outbound_tx, outbound_rx) = mpsc::channel(QUEUE_SIZE);
+        let (inbound_tx, inbound_rx) = tun::inbound_channel();
+        let (outbound_tx, outbound_rx) = tun::outbound_channel();
 
         runtime.spawn(otel_instruments::periodic_queue_length(
             outbound_tx.downgrade(),
             [
-                otel::attr::queue_item_ip_packet(),
-                otel::attr::network_io_direction_transmit(),
+                otel_attributes::queue_item_ip_packet_batch(),
+                otel_attributes::network_io_direction_transmit(),
             ],
         ));
         runtime.spawn(otel_instruments::periodic_queue_length(
             inbound_tx.downgrade(),
             [
-                otel::attr::queue_item_ip_packet(),
-                otel::attr::network_io_direction_receive(),
+                otel_attributes::queue_item_ip_packet_batch(),
+                otel_attributes::network_io_direction_receive(),
             ],
         ));
 
@@ -108,11 +107,11 @@ impl Tun {
 }
 
 impl tun::Tun for Tun {
-    fn sender(&self) -> &mpsc::Sender<IpPacket> {
+    fn sender(&self) -> &tun::OutboundTx {
         &self.outbound_tx
     }
 
-    fn receiver(&mut self) -> &mut mpsc::Receiver<IpPacket> {
+    fn receiver(&mut self) -> &mut tun::InboundRx {
         &mut self.inbound_rx
     }
 
@@ -250,6 +249,24 @@ fn name(fd: RawFd) -> io::Result<String> {
     Ok(String::from_utf8_lossy(&tunnel_name[..(tunnel_name_len - 1) as usize]).to_string())
 }
 
+/// How many descriptors [`search_for_tun_fd`] may scan.
+///
+/// The utun descriptor's number depends on how many others the extension already
+/// holds, so a fixed bound puts it out of reach once the process holds more than
+/// that many. `RLIMIT_NOFILE` is the highest number the kernel can hand out, and
+/// is what `getdtablesize` reports.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn fd_table_size() -> RawFd {
+    /// Applies when `getdtablesize` reports something unusable, and matches the
+    /// bound the scan used before it consulted the limit at all.
+    const FALLBACK: RawFd = 1024;
+
+    // SAFETY: `getdtablesize` takes no arguments and only reads process state.
+    let size = unsafe { libc::getdtablesize() };
+
+    if size <= 0 { FALLBACK } else { size }
+}
+
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 fn search_for_tun_fd() -> io::Result<RawFd> {
     const CTL_NAME: &[u8] = b"com.apple.net.utun_control";
@@ -279,8 +296,8 @@ fn search_for_tun_fd() -> io::Result<RawFd> {
     //
     // Credit to Jason Donenfeld (@zx2c4) for this technique. See docs/NOTICE.txt for attribution.
     // https://github.com/WireGuard/wireguard-apple/blob/master/Sources/WireGuardKit/WireGuardAdapter.swift
-    for fd in 0..1024 {
-        tracing::debug!("Checking fd {}", fd);
+    for fd in 0..fd_table_size() {
+        tracing::trace!("Checking fd {}", fd);
 
         // initialize empty sockaddr_ctl to be populated by getpeername
         let mut addr = sockaddr_ctl {
@@ -313,13 +330,17 @@ fn search_for_tun_fd() -> io::Result<RawFd> {
         }
 
         if addr.sc_id == info.ctl_id {
-            set_non_blocking(fd)?;
-
             return Ok(fd);
         }
     }
 
-    Err(get_last_error())
+    // Not `get_last_error`: every miss above leaves `errno` set by the probe that
+    // rejected the descriptor, so the final one describes whatever fd the scan
+    // happened to end on rather than the search itself.
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "No utun file descriptor found",
+    ))
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]

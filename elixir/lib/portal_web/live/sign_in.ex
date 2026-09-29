@@ -18,12 +18,30 @@ defmodule PortalWeb.SignIn do
     mount_account(account, params, socket)
   end
 
+  # The pending OAuth request rides through sign-in as redirect_to, so the app
+  # being connected can be named here. Read from the cache only: this page
+  # renders before the request has been validated, so it must not fetch.
+  defp connecting_client(%{"redirect_to" => redirect_to}) when is_binary(redirect_to) do
+    with %URI{path: path, query: query} when is_binary(query) <- URI.parse(redirect_to),
+         true <- String.ends_with?(path || "", "/oauth/authorize"),
+         %{"client_id" => client_id} <- URI.decode_query(query) do
+      Portal.OAuth.cached_client(client_id)
+    else
+      _other -> nil
+    end
+  end
+
+  defp connecting_client(_params), do: nil
+
   defp mount_account(account, params, socket) do
+    connecting_client = connecting_client(params)
+
     socket =
       assign(socket,
         page_title: "Sign In",
         account: account,
         params: PortalWeb.Authentication.take_sign_in_params(params),
+        connecting_client: connecting_client,
         google_auth_providers: auth_providers(account, Google.AuthProvider),
         okta_auth_providers: auth_providers(account, Okta.AuthProvider),
         entra_auth_providers: auth_providers(account, Entra.AuthProvider),
@@ -32,22 +50,30 @@ defmodule PortalWeb.SignIn do
         userpass_auth_provider: auth_providers(account, Userpass.AuthProvider)
       )
 
-    {:ok, socket}
+    if connecting_client do
+      # Part of an app connection, so it keeps the centered look the consent
+      # screen uses rather than the marketing panel of a plain sign-in.
+      {:ok, socket, layout: {PortalWeb.Layouts, :standalone}}
+    else
+      {:ok, socket}
+    end
   end
 
   def render(assigns) do
     ~H"""
-    <.flash flash={@flash} kind={:error} />
-    <.flash flash={@flash} kind={:info} />
+    <Core.flash flash={@flash} kind={:error} />
+    <Core.flash flash={@flash} kind={:info} />
 
     <%= if trial_ends_at = get_in(@account.metadata.stripe.trial_ends_at) do %>
       <% trial_ends_in_days = trial_ends_at |> DateTime.diff(DateTime.utc_now(), :day) %>
 
-      <.flash :if={trial_ends_in_days <= 0} kind={:error}>
+      <Core.flash :if={trial_ends_in_days <= 0} kind={:error}>
         Your trial has expired and needs to be renewed.
         Contact your account manager or administrator to ensure uninterrupted service.
-      </.flash>
+      </Core.flash>
     <% end %>
+
+    <Page.oauth_client_header :if={@connecting_client} client={@connecting_client} />
 
     <div class="flex items-center gap-3 mb-8 mt-4">
       <div class="w-11 h-11 rounded bg-brand/10 border border-brand/20 flex items-center justify-center shrink-0">
@@ -65,7 +91,7 @@ defmodule PortalWeb.SignIn do
       </div>
     </div>
 
-    <.intersperse_blocks>
+    <Core.intersperse_blocks>
       <:separator>
         <.separator />
       </:separator>
@@ -85,7 +111,7 @@ defmodule PortalWeb.SignIn do
             type="google"
           >
             <:icon>
-              <.provider_icon provider="google" size="md" />
+              <Core.provider_icon provider="google" size="md" />
             </:icon>
           </.auth_button>
 
@@ -97,7 +123,7 @@ defmodule PortalWeb.SignIn do
             type="okta"
           >
             <:icon>
-              <.provider_icon provider="okta" size="md" />
+              <Core.provider_icon provider="okta" size="md" />
             </:icon>
           </.auth_button>
 
@@ -109,7 +135,7 @@ defmodule PortalWeb.SignIn do
             type="entra"
           >
             <:icon>
-              <.provider_icon provider="entra" size="md" />
+              <Core.provider_icon provider="entra" size="md" />
             </:icon>
           </.auth_button>
 
@@ -121,7 +147,7 @@ defmodule PortalWeb.SignIn do
             type="oidc"
           >
             <:icon>
-              <.provider_icon provider={provider_type_from_issuer(provider.issuer)} size="md" />
+              <Core.provider_icon provider={Core.provider_type_from_issuer(provider.issuer)} size="md" />
             </:icon>
           </.auth_button>
         </div>
@@ -144,19 +170,19 @@ defmodule PortalWeb.SignIn do
           params={@params}
         />
       </:item>
-    </.intersperse_blocks>
+    </Core.intersperse_blocks>
 
     <div
-      :if={!PortalWeb.Authentication.client_sign_in?(@params)}
+      :if={!PortalWeb.Authentication.client_sign_in?(@params) and is_nil(@connecting_client)}
       class="mt-8 pt-6 border-t border-border text-center"
     >
       <p class="text-xs text-subtle leading-relaxed">
         Meant to sign in from a client instead?
-        <.website_link path="/kb/client-apps">Read the docs.</.website_link>
+        <Navigation.website_link path="/kb/client-apps">Read the docs.</Navigation.website_link>
       </p>
       <p class="text-xs text-subtle mt-1.5">
         Looking for a different account?
-        <.link href={~p"/"} class={[link_style()]}>See recently used accounts.</.link>
+        <Navigation.link href={~p"/"}>See recently used accounts.</Navigation.link>
       </p>
     </div>
     """
@@ -166,7 +192,7 @@ defmodule PortalWeb.SignIn do
     ~H"""
     <div class="flex items-center gap-3 my-5">
       <div class="flex-1 h-px bg-border"></div>
-      <span class="text-xs text-muted">or</span>
+      <span class="text-xs text-subtle">or</span>
       <div class="flex-1 h-px bg-border"></div>
     </div>
     """
@@ -180,17 +206,17 @@ defmodule PortalWeb.SignIn do
 
   defp auth_button(assigns) do
     ~H"""
-    <.link
+    <Navigation.link
       class="w-full flex items-center gap-3 px-4 py-3 rounded border-2 border-border bg-surface hover:border-brand hover:shadow-sm transition-all duration-150 group text-sm font-medium text-heading"
       href={~p"/#{@account}/sign_in/#{@type}/#{@provider.id}?#{@params}"}
     >
       {render_slot(@icon)}
       <span class="flex-1">Continue with <strong>{@provider.name}</strong></span>
-      <.icon
+      <Core.icon
         name="ri-arrow-right-s-line"
-        class="w-5 h-5 text-muted group-hover:text-brand group-hover:translate-x-0.5 transition-all shrink-0"
+        class="w-5 h-5 text-subtle group-hover:text-brand group-hover:translate-x-0.5 transition-all shrink-0"
       />
-    </.link>
+    </Navigation.link>
     """
   end
 
@@ -209,20 +235,20 @@ defmodule PortalWeb.SignIn do
       phx-hook="AttachDisableSubmit"
       phx-submit={JS.dispatch("form:disable_and_submit", to: "#userpass_form")}
     >
-      <.input :for={{key, value} <- @params} type="hidden" name={key} value={value} />
+      <Form.input :for={{key, value} <- @params} type="hidden" name={key} value={value} />
       <input
         type="text"
         name="userpass[idp_id]"
         value={@userpass_form[:idp_id].value}
         placeholder="Username"
-        class="w-full px-3 py-2 text-sm rounded border bg-input border-input-border text-heading outline-none focus:border-border-focus focus:ring-1 focus:ring-border-focus/30 transition-colors placeholder:text-muted"
+        class="w-full px-3 py-2 text-sm rounded border bg-input border-input-border text-heading outline-none focus:border-border-focus focus:ring-1 focus:ring-border-focus/30 transition-colors placeholder:text-subtle"
         required
       />
       <input
         type="password"
         name="userpass[secret]"
         placeholder="Password"
-        class="w-full px-3 py-2 text-sm rounded border bg-input border-input-border text-heading outline-none focus:border-border-focus focus:ring-1 focus:ring-border-focus/30 transition-colors placeholder:text-muted"
+        class="w-full px-3 py-2 text-sm rounded border bg-input border-input-border text-heading outline-none focus:border-border-focus focus:ring-1 focus:ring-border-focus/30 transition-colors placeholder:text-subtle"
         required
       />
       <button
@@ -249,14 +275,14 @@ defmodule PortalWeb.SignIn do
       phx-hook="AttachDisableSubmit"
       phx-submit={JS.dispatch("form:disable_and_submit", to: "#email_form")}
     >
-      <.input :for={{key, value} <- @params} type="hidden" name={key} value={value} />
+      <Form.input :for={{key, value} <- @params} type="hidden" name={key} value={value} />
       <div class="flex gap-2">
         <input
           type="email"
           name="email[email]"
           value={@email_form[:email].value}
           placeholder="you@example.com"
-          class="flex-1 px-3 py-2 text-sm rounded border bg-input border-input-border text-heading outline-none focus:border-border-focus focus:ring-1 focus:ring-border-focus/30 transition-colors placeholder:text-muted"
+          class="flex-1 px-3 py-2 text-sm rounded border bg-input border-input-border text-heading outline-none focus:border-border-focus focus:ring-1 focus:ring-border-focus/30 transition-colors placeholder:text-subtle"
           required
         />
         <button
@@ -268,10 +294,6 @@ defmodule PortalWeb.SignIn do
       </div>
     </.form>
     """
-  end
-
-  def adapter_enabled?(providers_by_adapter, adapter) do
-    Map.get(providers_by_adapter, adapter, []) != []
   end
 
   defp auth_providers(account, module) do
@@ -293,18 +315,18 @@ defmodule PortalWeb.SignIn do
           do: from(a in Account, where: a.id == ^id_or_slug),
           else: from(a in Account, where: a.slug == ^id_or_slug)
 
-      query |> Safe.unscoped(:replica) |> Safe.one!()
+      query |> Safe.unscoped() |> Safe.one!()
     end
 
     def get_auth_provider(account, module) do
       from(ap in module, where: ap.account_id == ^account.id and not ap.is_disabled)
-      |> Safe.unscoped(:replica)
+      |> Safe.unscoped()
       |> Safe.one()
     end
 
     def list_auth_providers(account, module) do
       from(ap in module, where: ap.account_id == ^account.id and not ap.is_disabled)
-      |> Safe.unscoped(:replica)
+      |> Safe.unscoped()
       |> Safe.all()
     end
   end

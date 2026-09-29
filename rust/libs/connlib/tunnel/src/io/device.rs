@@ -2,28 +2,24 @@ use anyhow::Result;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use ip_packet::IpPacket;
-use smallvec::SmallVec;
+use std::collections::VecDeque;
 use std::mem;
 use std::task::ready;
 use std::task::{Context, Poll, Waker};
-use tun::Tun;
-
-/// How many packets we at most expect to buffer on the stack.
-///
-/// Assuming the channel to our TUN send thread is completely full, we should at most get one more batch of packets from the UDP thread.
-/// How many packets we get there in one batch is platform-dependent but even on platforms like Linux where GSO is well supported,
-/// it shouldn't be more than 64 (32 for each IP version).
-///
-/// Using 128 here is already conservative and in case we exceed it, `SmallVec` will just allocate and not panic.
-/// Thus, in the happy path, this will be very efficient and only use stack-space.
-const MAX_BUFFERED_PACKETS: usize = 128;
+use tun::{PacketBatch, Tun};
 
 pub struct Device {
+    // The flush future holds a clone of the TUN device's sender and must be dropped
+    // before `tun`: `Tun`'s drop can wait for its worker threads, which only exit
+    // once all sender clones are gone. Fields drop in declaration order.
+    flush_future: Option<BoxFuture<'static, Result<()>>>,
     tun: Option<Box<dyn Tun>>,
     waker: Option<Waker>,
 
-    outbound_buffer: SmallVec<[IpPacket; MAX_BUFFERED_PACKETS]>,
-    flush_future: Option<BoxFuture<'static, Result<()>>>,
+    /// The batch of packets queued since the last call to [`Device::flush_batch`].
+    current_batch: PacketBatch,
+    /// Completed batches that did not fit into the channel yet.
+    pending_batches: VecDeque<PacketBatch>,
 }
 
 impl Device {
@@ -31,7 +27,8 @@ impl Device {
         Self {
             tun: None,
             waker: None,
-            outbound_buffer: SmallVec::new(),
+            current_batch: PacketBatch::default(),
+            pending_batches: VecDeque::new(),
             flush_future: None,
         }
     }
@@ -39,6 +36,9 @@ impl Device {
     pub(crate) fn set_tun(&mut self, tun: Box<dyn Tun>) {
         tracing::debug!(name = %tun.name(), "Initializing TUN device");
 
+        // A pending flush still holds a sender clone of the previous TUN device;
+        // drop it so the previous device's worker threads can exit.
+        self.flush_future = None;
         self.tun = Some(tun);
 
         if let Some(waker) = self.waker.take() {
@@ -48,27 +48,22 @@ impl Device {
 
     /// Remove the current TUN handle (e.g. to wrap/unwrap a demux adapter).
     pub(crate) fn take_tun(&mut self) -> Option<Box<dyn Tun>> {
+        // Release the sender clone before handing ownership back to the caller.
+        self.flush_future = None;
         self.tun.take()
     }
 
-    pub(crate) fn poll_read_many(
-        &mut self,
-        cx: &mut Context<'_>,
-        buf: &mut Vec<IpPacket>,
-        max: usize,
-    ) -> Poll<Result<usize>> {
+    pub(crate) fn poll_read(&mut self, cx: &mut Context<'_>) -> Poll<Result<PacketBatch>> {
         let Some(tun) = self.tun.as_mut() else {
             self.waker = Some(cx.waker().clone());
             return Poll::Pending;
         };
 
-        let n = ready!(tun.receiver().poll_recv_many(cx, buf, max));
-
-        if n == 0 {
+        let Some(batch) = ready!(tun.receiver().poll_recv(cx)) else {
             return Poll::Ready(Err(anyhow::Error::new(TunChannelClosed)));
-        }
+        };
 
-        Poll::Ready(Ok(n))
+        Poll::Ready(Ok(batch))
     }
 
     pub fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
@@ -77,19 +72,19 @@ impl Device {
         };
 
         let Some(fut) = self.flush_future.as_mut() else {
-            if self.outbound_buffer.is_empty() {
+            if self.pending_batches.is_empty() {
                 return Poll::Ready(Ok(()));
             }
 
-            tracing::trace!("Got buffered packets, building flush future");
+            tracing::trace!("Got pending batches, building flush future");
 
-            let buffered_packets = mem::take(&mut self.outbound_buffer);
+            let batches = mem::take(&mut self.pending_batches);
             let tx = tun.sender().clone();
 
             self.flush_future = Some(
                 async move {
-                    for packet in buffered_packets {
-                        tx.send(packet).await.map_err(|_| TunChannelClosed)?;
+                    for batch in batches {
+                        tx.send(batch).await.map_err(|_| TunChannelClosed)?;
                     }
 
                     Ok(())
@@ -110,35 +105,58 @@ impl Device {
         Poll::Ready(res)
     }
 
-    pub fn send(&mut self, packet: IpPacket) {
+    /// Queues a packet for the TUN device.
+    ///
+    /// Queued packets are buffered until the current batch is completed with
+    /// [`Device::flush_batch`].
+    pub fn queue(&mut self, packet: IpPacket) {
         debug_assert!(
             !packet.is_fz_p2p_control(),
             "FZ p2p control protocol packets should never leave `connlib`"
         );
 
+        if self.tun.is_none() {
+            return;
+        }
+
+        if let Err(packet) = self.current_batch.try_push(packet) {
+            // The batch is full: hand it off and start a new one.
+            let batch = mem::replace(&mut self.current_batch, PacketBatch::new(packet));
+
+            self.enqueue_batch(batch);
+        }
+    }
+
+    /// Marks the end of the current batch of packets, handing it to the TUN thread
+    /// as a single channel item.
+    pub fn flush_batch(&mut self) {
+        if self.current_batch.is_empty() {
+            return;
+        }
+
+        let batch = mem::take(&mut self.current_batch);
+
+        self.enqueue_batch(batch);
+    }
+
+    fn enqueue_batch(&mut self, batch: PacketBatch) {
         let Some(tun) = self.tun.as_ref() else {
             return;
         };
 
-        // Preserve ordering: if a flush is already in flight, this packet must queue behind the
-        // packets being flushed. Otherwise a `try_send` here could slip it into the channel ahead
-        // of them, reordering the stream we write to the TUN device.
-        if self.flush_future.is_some() {
-            self.outbound_buffer.push(packet);
-            return;
-        }
-
-        // Likewise, if we haven't started flushing yet but are already buffering (a previous
-        // `try_send` hit a full channel), this packet must queue behind those buffered packets.
-        if !self.outbound_buffer.is_empty() {
-            self.outbound_buffer.push(packet);
+        // Preserve ordering: if a flush is already in flight or batches are pending,
+        // this batch must queue behind them. Otherwise a `try_send` here could slip
+        // it into the channel ahead of them, reordering the stream we write to the
+        // TUN device.
+        if self.flush_future.is_some() || !self.pending_batches.is_empty() {
+            self.pending_batches.push_back(batch);
             return;
         }
 
         // Fast path: nothing queued, send immediately if the channel has capacity.
-        if let Err(packet) = tun.sender().try_send(packet).map_err(|e| e.into_inner()) {
-            tracing::trace!(?packet, "Unable to send packet into channel, buffering");
-            self.outbound_buffer.push(packet);
+        if let Err(batch) = tun.sender().try_send(batch).map_err(|e| e.into_inner()) {
+            tracing::trace!("Unable to send batch into channel, buffering");
+            self.pending_batches.push_back(batch);
         }
     }
 }
@@ -152,7 +170,6 @@ mod tests {
     use super::*;
     use anyhow::ErrorExt;
     use std::net::Ipv4Addr;
-    use tokio::sync::mpsc;
 
     #[tokio::test]
     async fn flush_returns_error_when_sender_channel_closed() {
@@ -165,7 +182,8 @@ mod tests {
             ip_packet::make::udp_packet(Ipv4Addr::LOCALHOST, Ipv4Addr::LOCALHOST, 1234, 5678, &[])
                 .unwrap();
 
-        device.send(packet);
+        device.queue(packet);
+        device.flush_batch();
 
         let err = std::future::poll_fn(|cx| device.poll_flush(cx))
             .await
@@ -192,8 +210,10 @@ mod tests {
 
         // We cycle 3 times to ensure we can send and flush again repeatedly.
         for _ in 0..3 {
-            device.send(packet.clone());
-            device.send(packet.clone()); // This one should get buffered.
+            device.queue(packet.clone());
+            device.flush_batch();
+            device.queue(packet.clone());
+            device.flush_batch(); // This batch should get buffered.
 
             let poll = device.poll_flush_noop_waker();
             assert!(poll.is_pending(), "Flush should suspend if channel is full");
@@ -209,7 +229,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn packets_do_not_overtake_buffered_packets_while_flushing() {
+    async fn batches_do_not_overtake_pending_batches_while_flushing() {
         let _guard = logging::test("trace");
 
         let mut device = Device::new();
@@ -221,9 +241,11 @@ mod tests {
         let packet_c = test_packet(3);
 
         // A claims the single channel slot via the `try_send` fast-path.
-        device.send(packet_a.clone());
+        device.queue(packet_a.clone());
+        device.flush_batch();
         // B finds the channel full and gets buffered.
-        device.send(packet_b.clone());
+        device.queue(packet_b.clone());
+        device.flush_batch();
 
         // Start flushing B. It can't make progress while the channel is still full, so the flush
         // stays in-flight (`flush_future` is `Some`).
@@ -235,21 +257,111 @@ mod tests {
 
         // C arrives while the flush is in-flight. It must queue behind B rather than racing ahead
         // through `try_send`.
-        device.send(packet_c.clone());
+        device.queue(packet_c.clone());
+        device.flush_batch();
 
         // Drain the channel and finish flushing. The receiver must observe A, then B, then C, and
         // never A, C, B.
-        assert_eq!(send_rx.recv().await.unwrap(), packet_a);
+        assert_eq!(expect_single(send_rx.recv().await.unwrap()), packet_a);
 
         std::future::poll_fn(|cx| device.poll_flush(cx))
             .await
             .unwrap();
-        assert_eq!(send_rx.recv().await.unwrap(), packet_b);
+        assert_eq!(expect_single(send_rx.recv().await.unwrap()), packet_b);
 
         std::future::poll_fn(|cx| device.poll_flush(cx))
             .await
             .unwrap();
-        assert_eq!(send_rx.recv().await.unwrap(), packet_c);
+        assert_eq!(expect_single(send_rx.recv().await.unwrap()), packet_c);
+    }
+
+    #[tokio::test]
+    async fn queue_starts_new_batch_when_full() {
+        let mut device = Device::new();
+        let (test_tun, mut send_rx, _send_tx) = TestTun::with_capacity(3);
+        device.set_tun(Box::new(test_tun));
+
+        for i in 0..(2 * tun::MAX_BATCH_SIZE + 50) {
+            device.queue(test_packet(i as u16));
+        }
+        device.flush_batch();
+
+        std::future::poll_fn(|cx| device.poll_flush(cx))
+            .await
+            .unwrap();
+
+        assert_eq!(send_rx.recv().await.unwrap().len(), tun::MAX_BATCH_SIZE);
+        assert_eq!(send_rx.recv().await.unwrap().len(), tun::MAX_BATCH_SIZE);
+        assert_eq!(send_rx.recv().await.unwrap().len(), 50);
+    }
+
+    #[tokio::test]
+    async fn take_tun_releases_in_flight_sender() {
+        let mut device = Device::new();
+        let (test_tun, mut send_rx, _recv_tx) = TestTun::new();
+        device.set_tun(Box::new(test_tun));
+        device.queue(test_packet(1));
+        device.flush_batch();
+        device.queue(test_packet(2));
+        device.flush_batch();
+        assert!(device.poll_flush_noop_waker().is_pending());
+
+        drop(device.take_tun().unwrap());
+
+        // A retained flush sender would keep the old TUN worker alive.
+        assert_eq!(expect_single(send_rx.recv().await.unwrap()), test_packet(1));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), send_rx.recv())
+                .await
+                .expect("taking TUN must release all internal sender clones")
+                .is_none()
+        );
+        assert!(device.take_tun().is_none());
+    }
+
+    #[tokio::test]
+    async fn taken_tun_can_be_reinstalled_and_receive_packets() {
+        use futures::task::{ArcWake, waker};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        struct WakeFlag(AtomicBool);
+        impl ArcWake for WakeFlag {
+            fn wake_by_ref(this: &Arc<Self>) {
+                this.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let mut device = Device::new();
+        let (test_tun, _send_rx, recv_tx) = TestTun::new();
+        device.set_tun(Box::new(test_tun));
+        let tun = device.take_tun().unwrap();
+        let flag = Arc::new(WakeFlag(AtomicBool::new(false)));
+        let waker = waker(flag.clone());
+        assert!(
+            device
+                .poll_read(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+
+        device.set_tun(tun);
+        assert!(flag.0.load(Ordering::SeqCst));
+        recv_tx
+            .send(PacketBatch::new(test_packet(3)))
+            .await
+            .unwrap();
+        let batch = std::future::poll_fn(|cx| device.poll_read(cx))
+            .await
+            .unwrap();
+        assert_eq!(expect_single(batch), test_packet(3));
+    }
+
+    fn expect_single(mut batch: PacketBatch) -> IpPacket {
+        assert_eq!(batch.len(), 1, "Expected exactly one packet in the batch");
+
+        batch.drain().next().unwrap()
     }
 
     fn test_packet(dst_port: u16) -> IpPacket {
@@ -264,25 +376,29 @@ mod tests {
     }
 
     struct TestTun {
-        send_tx: mpsc::Sender<IpPacket>,
-        recv_rx: mpsc::Receiver<IpPacket>,
+        send_tx: tun::OutboundTx,
+        recv_rx: tun::InboundRx,
     }
 
     impl TestTun {
-        fn new() -> (Self, mpsc::Receiver<IpPacket>, mpsc::Sender<IpPacket>) {
-            let (send_tx, send_rx) = mpsc::channel(1);
-            let (recv_tx, recv_rx) = mpsc::channel(1);
+        fn new() -> (Self, tun::OutboundRx, tun::InboundTx) {
+            Self::with_capacity(1)
+        }
+
+        fn with_capacity(capacity: usize) -> (Self, tun::OutboundRx, tun::InboundTx) {
+            let (send_tx, send_rx) = tun::outbound_channel_for_test(capacity);
+            let (recv_tx, recv_rx) = tun::inbound_channel();
 
             (Self { send_tx, recv_rx }, send_rx, recv_tx)
         }
     }
 
     impl Tun for TestTun {
-        fn sender(&self) -> &mpsc::Sender<IpPacket> {
+        fn sender(&self) -> &tun::OutboundTx {
             &self.send_tx
         }
 
-        fn receiver(&mut self) -> &mut mpsc::Receiver<IpPacket> {
+        fn receiver(&mut self) -> &mut tun::InboundRx {
             &mut self.recv_rx
         }
 

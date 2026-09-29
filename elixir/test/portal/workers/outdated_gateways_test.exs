@@ -7,6 +7,7 @@ defmodule Portal.Workers.OutdatedGatewaysTest do
   import Portal.DeviceFixtures
   import Portal.ClientSessionFixtures
   import Portal.OutboundEmailTestHelpers
+  import Portal.SessionLogFixtures
   import Portal.SiteFixtures
 
   alias Portal.Workers.OutdatedGateways
@@ -59,7 +60,7 @@ defmodule Portal.Workers.OutdatedGatewaysTest do
 
       # Age the session beyond one week
       session
-      |> Ecto.Changeset.change(inserted_at: DateTime.utc_now() |> DateTime.add(-8, :day))
+      |> Ecto.Changeset.change(last_seen_at: DateTime.utc_now() |> DateTime.add(-8, :day))
       |> Repo.update!()
 
       assert OutdatedGateways.Database.count_incompatible_for(account, "1.3.0") == 0
@@ -79,7 +80,7 @@ defmodule Portal.Workers.OutdatedGatewaysTest do
 
       # Disable the actor
       actor
-      |> Ecto.Changeset.change(disabled_at: DateTime.utc_now())
+      |> Ecto.Changeset.change(is_disabled: true)
       |> Repo.update!()
 
       assert OutdatedGateways.Database.count_incompatible_for(account, "1.3.0") == 0
@@ -144,6 +145,7 @@ defmodule Portal.Workers.OutdatedGatewaysTest do
         )
 
       admin = admin_actor_fixture(account: account)
+      session_log_fixture(account: account)
       site = site_fixture(account: account)
 
       gateway =
@@ -154,12 +156,12 @@ defmodule Portal.Workers.OutdatedGatewaysTest do
         )
 
       assert :ok =
-               Portal.Presence.Gateways.connect(
+               Portal.Presence.Devices.connect(
                  gateway,
-                 gateway.latest_session.gateway_token_id
+                 gateway.gateway_token_id
                )
 
-      assert Map.has_key?(Portal.Presence.Gateways.Site.list(site.id), gateway.id)
+      assert gateway.id in Portal.Presence.Devices.online_ids(account.id, :gateway)
 
       assert :ok = perform_job(OutdatedGateways, %{})
 
@@ -169,6 +171,66 @@ defmodule Portal.Workers.OutdatedGatewaysTest do
       end)
 
       refute_email_sent()
+    end
+
+    test "skips accounts with no session logs" do
+      account =
+        account_fixture(
+          config: %{
+            notifications: %{
+              outdated_gateway: %{enabled: true}
+            }
+          }
+        )
+
+      admin_actor_fixture(account: account)
+      site = site_fixture(account: account)
+
+      gateway =
+        gateway_fixture(
+          account: account,
+          site: site,
+          last_seen_version: "0.9.0"
+        )
+
+      assert :ok = Portal.Presence.Devices.connect(gateway, gateway.gateway_token_id)
+
+      assert :ok = perform_job(OutdatedGateways, %{})
+
+      refute_email_queued(account.id)
+
+      # The account stays pending so it is notified as soon as it comes back.
+      account = Portal.Repo.get!(Portal.Account, account.id)
+      assert is_nil(account.config.notifications.outdated_gateway.last_notified)
+    end
+
+    test "notifies a paid account with no session logs" do
+      account =
+        team_account_fixture(
+          config: %{
+            notifications: %{
+              outdated_gateway: %{enabled: true}
+            }
+          }
+        )
+
+      admin = admin_actor_fixture(account: account)
+      site = site_fixture(account: account)
+
+      gateway =
+        gateway_fixture(
+          account: account,
+          site: site,
+          last_seen_version: "0.9.0"
+        )
+
+      assert :ok = Portal.Presence.Devices.connect(gateway, gateway.gateway_token_id)
+
+      assert :ok = perform_job(OutdatedGateways, %{})
+
+      assert_email_queued(account.id, fn email ->
+        assert email.bcc == [{"", admin.email}]
+      end)
     end
   end
 end

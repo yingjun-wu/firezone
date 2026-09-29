@@ -23,6 +23,14 @@ defmodule Portal.Accounts.Deletion do
     end
   end
 
+  def change_deletion_feedback(%Account{} = account, feedback \\ nil) do
+    Database.change_deletion_feedback(account, feedback)
+  end
+
+  def save_deletion_feedback(%Account{} = account, feedback, subject) do
+    Database.save_deletion_feedback(account, feedback, subject)
+  end
+
   defp enqueue_deletion_notification(%Account{} = account, subject) do
     notify_admins(
       account,
@@ -81,6 +89,7 @@ defmodule Portal.Accounts.Deletion do
 
   defmodule Database do
     import Ecto.Query
+    import Ecto.Changeset
 
     alias Portal.Account
     alias Portal.Actor
@@ -103,7 +112,7 @@ defmodule Portal.Accounts.Deletion do
         with {:ok, transition} <-
                transition_account_deletion(
                  account,
-                 %{disabled_at: nil, scheduled_deletion_at: nil},
+                 %{is_disabled: false, scheduled_deletion_at: nil},
                  :cancel,
                  subject
                ),
@@ -114,9 +123,29 @@ defmodule Portal.Accounts.Deletion do
       end)
     end
 
+    def change_deletion_feedback(%Account{} = account, feedback) do
+      account
+      |> cast(%{metadata: %{deletion_feedback: feedback}}, [])
+      |> cast_embed(:metadata)
+      |> Account.changeset()
+    end
+
+    def save_deletion_feedback(
+          %Account{id: account_id} = account,
+          feedback,
+          %{account: %{id: account_id}} = subject
+        ) do
+      account
+      |> change_deletion_feedback(feedback)
+      |> Safe.scoped(subject)
+      |> Safe.update()
+    end
+
+    def save_deletion_feedback(_account, _feedback, _subject), do: {:error, :unauthorized}
+
     defp fetch_account(account_id, subject) do
       from(a in Account, where: a.id == ^account_id)
-      |> Safe.scoped(subject, :replica)
+      |> Safe.scoped(subject)
       |> Safe.one()
       |> case do
         %Account{} = account -> {:ok, account}
@@ -142,7 +171,7 @@ defmodule Portal.Accounts.Deletion do
 
       updates =
         attrs
-        |> Map.take([:disabled_at, :scheduled_deletion_at])
+        |> Map.take([:is_disabled, :scheduled_deletion_at])
         |> Map.put(:updated_at, now)
 
       case query |> Safe.scoped(subject) |> Safe.update_all(set: Map.to_list(updates)) do
@@ -205,7 +234,7 @@ defmodule Portal.Accounts.Deletion do
       from(a in Actor,
         where: a.account_id == ^account_id,
         where: a.type == :account_admin_user,
-        where: is_nil(a.disabled_at),
+        where: a.is_disabled == false,
         select: a.email
       )
       |> Safe.scoped(subject)

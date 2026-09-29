@@ -107,35 +107,6 @@ defmodule Portal.Mocks.Stripe do
     [{"GET", "/v1/products/#{product["id"]}", 200, product}]
   end
 
-  def mock_fetch_product_endpoint(product_id, resp \\ %{}) do
-    response =
-      Map.merge(
-        %{
-          "id" => product_id,
-          "object" => "product",
-          "active" => true,
-          "created" => 1_678_833_149,
-          "default_price" => nil,
-          "description" => nil,
-          "images" => [],
-          "features" => [],
-          "livemode" => false,
-          "metadata" => %{},
-          "name" => "Enterprise",
-          "package_dimensions" => nil,
-          "shippable" => nil,
-          "statement_descriptor" => nil,
-          "tax_code" => nil,
-          "unit_label" => nil,
-          "updated" => 1_678_833_149,
-          "url" => nil
-        },
-        resp
-      )
-
-    [{"GET", "/v1/products/#{product_id}", 200, response}]
-  end
-
   def mock_create_billing_session_endpoint(account, resp \\ %{}) do
     response =
       Map.merge(
@@ -556,8 +527,7 @@ defmodule Portal.Mocks.Stripe do
       "monthly_active_users_count" => "unlimited",
       "policy_conditions" => true,
       "service_accounts_count" => 100,
-      "support_type" => "email",
-      "traffic_filters" => true
+      "support_type" => "email"
     }
     |> Map.merge(opts)
   end
@@ -572,10 +542,8 @@ defmodule Portal.Mocks.Stripe do
       "internet_resource" => true,
       "monthly_active_users_count" => "unlimited",
       "policy_conditions" => true,
-      "rest_api" => true,
       "service_accounts_count" => "unlimited",
       "support_type" => "email_and_slack",
-      "traffic_filters" => true,
       "users_count" => "unlimited"
     }
     |> Map.merge(opts)

@@ -4,13 +4,8 @@ defmodule Portal.ComponentVersionsTest do
   alias Portal.ComponentVersions
   alias Portal.Mocks.FirezoneWebsite
 
-  setup do
-    bypass = Bypass.open()
-    %{bypass: bypass}
-  end
-
   describe "fetch_versions/0" do
-    test "fetches versions from url", %{bypass: bypass} do
+    test "fetches versions from url" do
       versions = %{
         apple: "1.1.1",
         android: "1.1.1",
@@ -19,13 +14,13 @@ defmodule Portal.ComponentVersionsTest do
         headless: "1.1.1"
       }
 
-      FirezoneWebsite.mock_versions_endpoint(bypass, versions)
+      FirezoneWebsite.mock_versions_endpoint(versions)
 
       new_config =
         Portal.Config.get_env(:portal, ComponentVersions)
         |> Keyword.merge(
           fetch_from_url: true,
-          firezone_releases_url: "http://localhost:#{bypass.port}/api/releases"
+          firezone_releases_url: "https://www.firezone.dev/api/releases"
         )
 
       Portal.Config.put_env_override(ComponentVersions, new_config)
@@ -57,7 +52,7 @@ defmodule Portal.ComponentVersionsTest do
       client = %Portal.Device{
         type: :client,
         actor: %Portal.Actor{type: :service_account},
-        latest_session: nil
+        last_seen_user_agent: nil
       }
 
       assert get_component_type(client) == :headless
@@ -67,7 +62,7 @@ defmodule Portal.ComponentVersionsTest do
       client = %Portal.Device{
         type: :client,
         actor: %Portal.Actor{type: :account_user},
-        latest_session: %{user_agent: "Mac OS/14.0"}
+        last_seen_user_agent: "Mac OS/14.0"
       }
 
       assert get_component_type(client) == :apple
@@ -77,7 +72,7 @@ defmodule Portal.ComponentVersionsTest do
       client = %Portal.Device{
         type: :client,
         actor: %Portal.Actor{type: :account_user},
-        latest_session: %{user_agent: "iOS/17.0"}
+        last_seen_user_agent: "iOS/17.0"
       }
 
       assert get_component_type(client) == :apple
@@ -87,7 +82,7 @@ defmodule Portal.ComponentVersionsTest do
       client = %Portal.Device{
         type: :client,
         actor: %Portal.Actor{type: :account_user},
-        latest_session: %{user_agent: "Android/14"}
+        last_seen_user_agent: "Android/14"
       }
 
       assert get_component_type(client) == :android
@@ -97,7 +92,7 @@ defmodule Portal.ComponentVersionsTest do
       client = %Portal.Device{
         type: :client,
         actor: %Portal.Actor{type: :account_user},
-        latest_session: %{user_agent: "Windows/10"}
+        last_seen_user_agent: "Windows/10"
       }
 
       assert get_component_type(client) == :gui
@@ -112,11 +107,11 @@ defmodule Portal.ComponentVersionsTest do
       assert get_component_type_from_user_agent("Linux/6.1.0 android-client/1.5.8") == :android
     end
 
-    test "returns :gui when latest_session is nil" do
+    test "returns :gui when last_seen_user_agent is nil" do
       client = %Portal.Device{
         type: :client,
         actor: %Portal.Actor{type: :account_user},
-        latest_session: nil
+        last_seen_user_agent: nil
       }
 
       assert get_component_type(client) == :gui

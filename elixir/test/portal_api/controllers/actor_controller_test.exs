@@ -96,6 +96,80 @@ defmodule PortalAPI.ActorControllerTest do
 
       assert MapSet.subset?(data_ids, actor_ids)
     end
+
+    test "returns error for a non-integer limit", %{conn: conn, actor: actor} do
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> get("/actors", limit: "abc")
+
+      assert %{"type" => "about:blank", "status" => 400} = json_response(conn, 400)
+    end
+
+    test "returns error for a limit outside 1 to 100", %{conn: conn, actor: actor} do
+      for limit <- ["0", "-1", "101"] do
+        conn =
+          conn
+          |> authorize_conn(actor)
+          |> put_req_header("content-type", "application/json")
+          |> get("/actors", limit: limit)
+
+        assert %{"type" => "about:blank", "status" => 400} = json_response(conn, 400)
+      end
+    end
+
+    test "filters by exact name match", %{conn: conn, account: account, actor: actor} do
+      target = actor_fixture(account: account, name: "alice", type: :account_user)
+      _other = actor_fixture(account: account, name: "bob", type: :account_user)
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> get("/actors", name: "alice")
+
+      assert %{"data" => [data]} = json_response(conn, 200)
+      assert data["id"] == target.id
+    end
+
+    test "filters by exact email match", %{conn: conn, account: account, actor: actor} do
+      target = actor_fixture(account: account, email: "alice@example.com", type: :account_user)
+      _other = actor_fixture(account: account, email: "bob@example.com", type: :account_user)
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> get("/actors", email: "alice@example.com")
+
+      assert %{"data" => [data]} = json_response(conn, 200)
+      assert data["id"] == target.id
+    end
+
+    test "filters by type", %{conn: conn, account: account, actor: actor} do
+      target = actor_fixture(account: account, type: :service_account)
+      _other = actor_fixture(account: account, type: :account_user)
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> get("/actors", type: "service_account")
+
+      assert %{"data" => [data]} = json_response(conn, 200)
+      assert data["id"] == target.id
+    end
+
+    test "rejects an invalid type filter value", %{conn: conn, actor: actor} do
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> get("/actors", type: "bogus")
+
+      assert %{"status" => 400} = json_response(conn, 400)
+    end
   end
 
   describe "show/2" do
@@ -147,7 +221,7 @@ defmodule PortalAPI.ActorControllerTest do
                  "type" => Atom.to_string(actor.type),
                  "allow_email_otp_sign_in" => actor.allow_email_otp_sign_in,
                  "created_by_directory_id" => actor.created_by_directory_id,
-                 "disabled_at" => iso8601(actor.disabled_at),
+                 "is_disabled" => actor.is_disabled,
                  "email" => actor.email,
                  "inserted_at" => iso8601(actor.inserted_at),
                  "last_seen_at" => iso8601(actor.last_seen_at),
@@ -208,7 +282,7 @@ defmodule PortalAPI.ActorControllerTest do
       assert %{
                "status" => 422,
                "validation_errors" => %{
-                 "type" => ["API clients cannot be created via the API"]
+                 "type" => ["is invalid"]
                }
              } = json_response(conn, 422)
     end
@@ -309,6 +383,19 @@ defmodule PortalAPI.ActorControllerTest do
       assert resp["data"]["name"] == attrs["name"]
       assert resp["data"]["email"] == attrs["email"]
       assert resp["data"]["type"] == attrs["type"]
+    end
+
+    test "returns validation error when the email domain cannot be encoded", %{conn: conn, actor: api_actor} do
+      attrs = %{"name" => "Test User", "email" => "Ï@ú1å?", "type" => "account_user"}
+
+      conn =
+        conn
+        |> authorize_conn(api_actor)
+        |> put_req_header("content-type", "application/json")
+        |> post("/actors", actor: attrs)
+
+      assert %{"status" => 422, "validation_errors" => %{"email" => errors}} = json_response(conn, 422)
+      assert "is an invalid email address" in errors
     end
 
     test "returns validation error when email host has no dot", %{conn: conn, actor: api_actor} do
@@ -577,7 +664,7 @@ defmodule PortalAPI.ActorControllerTest do
 
       assert resp = json_response(conn, 422)
       assert resp["validation_errors"]["type"] ==
-               ["cannot change a user to a service account or API client"]
+               ["is invalid"]
 
       assert Repo.get_by!(Portal.Actor, account_id: account.id, id: actor.id).type ==
                :account_user
@@ -625,7 +712,7 @@ defmodule PortalAPI.ActorControllerTest do
 
       assert resp = json_response(conn, 422)
       assert resp["validation_errors"]["type"] ==
-               ["cannot change a user to a service account or API client"]
+               ["is invalid"]
 
       assert Repo.get_by!(Portal.Actor, account_id: account.id, id: actor.id).type ==
                :account_admin_user
@@ -671,8 +758,14 @@ defmodule PortalAPI.ActorControllerTest do
           |> put("/actors/#{target.id}", actor: %{"type" => type})
 
         assert resp = json_response(request_conn, 422)
-        assert resp["validation_errors"]["type"] ==
-                 ["cannot change the type of a service account"]
+
+        # api_client is not a type the request schema accepts at all.
+        expected =
+          if type == "api_client",
+            do: ["is invalid"],
+            else: ["cannot change the type of a service account"]
+
+        assert resp["validation_errors"]["type"] == expected
       end
 
       assert Repo.get_by!(Portal.Actor, account_id: account.id, id: target.id).type ==
@@ -778,7 +871,7 @@ defmodule PortalAPI.ActorControllerTest do
                  "type" => Atom.to_string(actor.type),
                  "allow_email_otp_sign_in" => actor.allow_email_otp_sign_in,
                  "created_by_directory_id" => actor.created_by_directory_id,
-                 "disabled_at" => iso8601(actor.disabled_at),
+                 "is_disabled" => actor.is_disabled,
                  "email" => actor.email,
                  "inserted_at" => iso8601(actor.inserted_at),
                  "last_seen_at" => iso8601(actor.last_seen_at),
@@ -787,6 +880,109 @@ defmodule PortalAPI.ActorControllerTest do
              }
 
       refute Repo.get_by(Actor, id: actor.id, account_id: actor.account_id)
+    end
+  end
+
+  describe "Database.delete_actor_by_id/2" do
+    test "returns unauthorized for a subject that may not delete Actors", %{account: account} do
+      # Not reachable through the REST API today - tokens only decode under the
+      # api_client salt - but Safe.delete_all/2 can still return this, and it
+      # has to surface as a 403 rather than crashing the request.
+      subject =
+        Portal.SubjectFixtures.subject_fixture(
+          account: account,
+          actor: [type: :service_account]
+        )
+
+      actor = actor_fixture(account: account)
+
+      assert PortalAPI.ActorController.Database.delete_actor_by_id(actor.id, subject) ==
+               {:error, :unauthorized}
+
+      assert Repo.get_by(Actor, id: actor.id, account_id: account.id)
+    end
+  end
+
+  describe "update/2 is_disabled" do
+    test "disables an actor", %{
+      conn: conn,
+      account: account,
+      actor: api_actor
+    } do
+      # Client token / portal session revocation on disable is driven by an
+      # async replication consumer (Portal.Changes.Hooks.Actors.on_update/3)
+      # that doesn't fire on a Repo.update inside the test sandbox - see
+      # test/portal/changes/hooks/actors_test.exs for that behavior.
+      actor = actor_fixture(account: account, type: :service_account)
+
+      conn =
+        conn
+        |> authorize_conn(api_actor)
+        |> put_req_header("content-type", "application/json")
+        |> put("/actors/#{actor.id}", actor: %{"is_disabled" => true})
+
+      assert %{"data" => %{"id" => id, "is_disabled" => true}} = json_response(conn, 200)
+      assert id == actor.id
+      assert Repo.get_by!(Actor, account_id: account.id, id: actor.id).is_disabled
+    end
+
+    test "disabling an already-disabled actor is idempotent", %{
+      conn: conn,
+      account: account,
+      actor: api_actor
+    } do
+      actor = disabled_actor_fixture(account: account)
+
+      conn =
+        conn
+        |> authorize_conn(api_actor)
+        |> put_req_header("content-type", "application/json")
+        |> put("/actors/#{actor.id}", actor: %{"is_disabled" => true})
+
+      assert %{"data" => %{"id" => id, "is_disabled" => true}} = json_response(conn, 200)
+      assert id == actor.id
+    end
+
+    test "enables a disabled actor", %{conn: conn, account: account, actor: api_actor} do
+      actor = disabled_actor_fixture(account: account)
+
+      conn =
+        conn
+        |> authorize_conn(api_actor)
+        |> put_req_header("content-type", "application/json")
+        |> put("/actors/#{actor.id}", actor: %{"is_disabled" => false})
+
+      assert %{"data" => %{"id" => id, "is_disabled" => false}} = json_response(conn, 200)
+      assert id == actor.id
+      refute Repo.get_by!(Actor, account_id: account.id, id: actor.id).is_disabled
+    end
+
+    test "returns forbidden when actor attempts to disable itself", %{
+      conn: conn,
+      account: account,
+      actor: api_actor
+    } do
+      conn =
+        conn
+        |> authorize_conn(api_actor)
+        |> put_req_header("content-type", "application/json")
+        |> put("/actors/#{api_actor.id}", actor: %{"is_disabled" => true})
+
+      assert %{"type" => "about:blank", "status" => 403} = json_response(conn, 403)
+      refute Repo.get_by!(Actor, account_id: account.id, id: api_actor.id).is_disabled
+    end
+
+    test "allows an actor to update itself without changing is_disabled", %{
+      conn: conn,
+      actor: api_actor
+    } do
+      conn =
+        conn
+        |> authorize_conn(api_actor)
+        |> put_req_header("content-type", "application/json")
+        |> put("/actors/#{api_actor.id}", actor: %{"is_disabled" => false})
+
+      assert %{"data" => %{"is_disabled" => false}} = json_response(conn, 200)
     end
   end
 

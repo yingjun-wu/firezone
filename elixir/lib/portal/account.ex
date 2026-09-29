@@ -1,7 +1,6 @@
 defmodule Portal.Account do
   use Ecto.Schema
   import Ecto.Changeset
-  alias Portal.Config
 
   @type t :: %__MODULE__{}
 
@@ -36,6 +35,8 @@ defmodule Portal.Account do
     has_many :auth_providers, Portal.AuthProvider
     has_many :external_identities, Portal.ExternalIdentity
     has_many :pending_identities, Portal.PendingIdentity
+    has_many :trust_anchors, Portal.TrustAnchor
+    has_many :trust_anchor_certificates, Portal.TrustAnchorCertificate
 
     has_many :policies, Portal.Policy
 
@@ -44,6 +45,17 @@ defmodule Portal.Account do
     has_many :resources, Portal.Resource
 
     has_many :devices, Portal.Device
+    has_many :posture_providers, Portal.PostureProvider
+    has_many :intune_posture_providers, Portal.Intune.PostureProvider
+    has_many :intune_devices, Portal.Intune.Device
+    has_many :iru_posture_providers, Portal.Iru.PostureProvider
+    has_many :iru_devices, Portal.Iru.Device
+    has_many :defender_posture_providers, Portal.Defender.PostureProvider
+    has_many :defender_devices, Portal.Defender.Device
+    has_many :santa_posture_providers, Portal.Santa.PostureProvider
+    has_many :santa_devices, Portal.Santa.Device
+    has_many :sentinelone_posture_providers, Portal.SentinelOne.PostureProvider
+    has_many :sentinelone_devices, Portal.SentinelOne.Device
     has_many :clients, Portal.Device, where: [type: :client]
     has_many :gateways, Portal.Device, where: [type: :gateway]
     has_many :sites, Portal.Site
@@ -62,6 +74,7 @@ defmodule Portal.Account do
     has_many :oidc_auth_providers, Portal.OIDC.AuthProvider
     has_one :email_otp_auth_provider, Portal.EmailOTP.AuthProvider
     has_one :userpass_auth_provider, Portal.Userpass.AuthProvider
+    has_one :x509_auth_provider, Portal.X509.AuthProvider
 
     # Billing limit exceeded flags - set by CheckAccountLimits worker and Stripe event processing
     field :users_limit_exceeded, :boolean, default: false
@@ -74,19 +87,23 @@ defmodule Portal.Account do
     field :warning_last_sent_at, :utc_datetime_usec
 
     field :disabled_reason, :string
-    field :disabled_at, :utc_datetime_usec
+    field :is_disabled, :boolean, default: false, read_after_writes: true
 
     field :scheduled_deletion_at, :utc_datetime_usec
 
     # Set by Ops Admins only. Prevents account admins from modifying account settings.
     field :lock_enabled_at, :utc_datetime_usec
 
+    # Usage against `limits`, computed by the REST API when it renders the account.
+    field :limit_usage, :map, virtual: true
+
     timestamps()
   end
 
   def changeset(changeset) do
     changeset
-    |> validate_length(:name, min: 3, max: 64)
+    |> validate_length(:name, min: 3, message: "too short")
+    |> validate_length(:name, max: 64, message: "too long")
     |> validate_length(:slug, min: 3, max: 100)
     |> validate_length(:key, is: 6)
     |> validate_key_format()
@@ -119,7 +136,7 @@ defmodule Portal.Account do
   end
 
   @spec active?(t()) :: boolean()
-  def active?(%__MODULE__{disabled_at: nil}), do: true
+  def active?(%__MODULE__{is_disabled: false}), do: true
   def active?(%__MODULE__{}), do: false
 
   @spec pending_deletion?(t()) :: boolean()
@@ -131,48 +148,120 @@ defmodule Portal.Account do
   def locked?(%__MODULE__{}), do: true
 
   # sobelow_skip ["DOS.BinToAtom"]
-  for feature <- Portal.Accounts.Features.__schema__(:fields), feature != :iceless do
+  for feature <- Portal.Accounts.Features.__schema__(:fields) do
     def unquote(:"#{feature}_enabled?")(account) do
-      Config.global_feature_enabled?(unquote(feature)) and
-        account_feature_enabled?(account, unquote(feature))
+      account_feature_enabled?(account, unquote(feature))
     end
-  end
-
-  # Unlike the other features, ICE-less is gated per-account only and has no
-  # global `enabled_features` flag, so it can be rolled out to individual
-  # accounts without a release. Keeping the toggle in the portal (rather than a
-  # device-local flag) makes it the single source of truth, so client and
-  # gateway can never disagree on whether to use it.
-  def iceless_enabled?(account) do
-    account_feature_enabled?(account, :iceless)
   end
 
   defp account_feature_enabled?(account, feature) do
     Map.fetch!(account.features || %Portal.Accounts.Features{}, feature) || false
   end
-
-  @spec rest_api_access_requested?(t()) :: boolean()
-  def rest_api_access_requested?(%__MODULE__{metadata: %{rest_api_requested_at: at}})
-      when not is_nil(at),
-      do: true
-
-  def rest_api_access_requested?(%__MODULE__{}), do: false
 end
 
 defmodule Portal.Account.Metadata do
   use Ecto.Schema
   import Ecto.Changeset
 
+  @deletion_feedback_max_length 2000
+
   @primary_key false
   embedded_schema do
-    field :rest_api_requested_at, :utc_datetime_usec
+    field :marketing_attribution, :map
+    field :deletion_feedback, :string
     embeds_one :stripe, Portal.Account.Metadata.Stripe, on_replace: :update
+    embeds_one :sign_up_survey, Portal.Account.Metadata.SignUpSurvey, on_replace: :update
   end
+
+  def deletion_feedback_max_length, do: @deletion_feedback_max_length
 
   def changeset(metadata \\ %__MODULE__{}, attrs) do
     metadata
-    |> cast(attrs, [:rest_api_requested_at])
+    |> cast(attrs, [:marketing_attribution, :deletion_feedback])
+    |> validate_length(:deletion_feedback, max: @deletion_feedback_max_length)
     |> cast_embed(:stripe, with: &Portal.Account.Metadata.Stripe.changeset/2)
+    |> cast_embed(:sign_up_survey, with: &Portal.Account.Metadata.SignUpSurvey.changeset/2)
+  end
+end
+
+defmodule Portal.Account.Metadata.SignUpSurvey do
+  use Ecto.Schema
+  import Ecto.Changeset
+  import Portal.Changeset
+
+  @referral_sources ~w[search github reddit hacker_news word_of_mouth blog social_media event other]
+  @motivations ~w[performance access_controls simplicity security open_source cost other]
+  @use_cases ~w[personal servers internal_apps employees contractors other]
+  @roles ~w[it security devops software_engineer network_engineer founder consultant other]
+  @previous_solutions ~w[tailscale twingate cloudflare openvpn wireguard zerotier cisco zscaler other]
+  @other_max_length 255
+
+  @primary_key false
+  embedded_schema do
+    field :referral_source, :string
+    field :referral_source_other, :string
+    field :motivation, :string
+    field :motivation_other, :string
+    field :use_case, :string
+    field :use_case_other, :string
+    field :role, :string
+    field :role_other, :string
+    field :switching, :boolean
+    field :previous_solution, :string
+    field :previous_solution_other, :string
+  end
+
+  def other_max_length, do: @other_max_length
+
+  def changeset(survey \\ %__MODULE__{}, attrs) do
+    survey
+    |> cast(attrs, [
+      :referral_source,
+      :referral_source_other,
+      :motivation,
+      :motivation_other,
+      :use_case,
+      :use_case_other,
+      :role,
+      :role_other,
+      :switching,
+      :previous_solution,
+      :previous_solution_other
+    ])
+    |> validate_required([:referral_source, :motivation, :use_case, :role, :switching])
+    |> validate_inclusion(:referral_source, @referral_sources)
+    |> validate_inclusion(:motivation, @motivations)
+    |> validate_inclusion(:use_case, @use_cases)
+    |> validate_inclusion(:role, @roles)
+    |> validate_previous_solution()
+    |> validate_other(:referral_source, :referral_source_other)
+    |> validate_other(:motivation, :motivation_other)
+    |> validate_other(:use_case, :use_case_other)
+    |> validate_other(:role, :role_other)
+    |> validate_other(:previous_solution, :previous_solution_other)
+  end
+
+  defp validate_previous_solution(changeset) do
+    if get_field(changeset, :switching) do
+      changeset
+      |> validate_required([:previous_solution])
+      |> validate_inclusion(:previous_solution, @previous_solutions)
+    else
+      changeset
+      |> put_change(:previous_solution, nil)
+      |> put_change(:previous_solution_other, nil)
+    end
+  end
+
+  defp validate_other(changeset, field, other_field) do
+    if get_field(changeset, field) == "other" do
+      changeset
+      |> trim_change(other_field)
+      |> validate_required([other_field])
+      |> validate_length(other_field, max: @other_max_length, message: "too long")
+    else
+      put_change(changeset, other_field, nil)
+    end
   end
 end
 
@@ -184,6 +273,7 @@ defmodule Portal.Account.Metadata.Stripe do
   embedded_schema do
     field :customer_id, :string
     field :subscription_id, :string
+    field :subscription_status, :string
     field :product_name, :string
     field :billing_email, :string
     field :trial_ends_at, :utc_datetime_usec
@@ -195,6 +285,7 @@ defmodule Portal.Account.Metadata.Stripe do
     |> cast(attrs, [
       :customer_id,
       :subscription_id,
+      :subscription_status,
       :product_name,
       :billing_email,
       :trial_ends_at,

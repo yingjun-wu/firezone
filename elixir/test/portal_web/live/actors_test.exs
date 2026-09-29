@@ -4,6 +4,7 @@ defmodule PortalWeb.ActorsTest do
   alias Portal.Actor
   alias Portal.Changes.Change
 
+  import ExUnit.CaptureLog
   import Portal.AccountFixtures
   import Portal.ActorFixtures
   import Portal.AuthProviderFixtures
@@ -343,6 +344,26 @@ defmodule PortalWeb.ActorsTest do
       assert html =~ other_actor.name
     end
 
+    test "ignores a tab change queued while the actor panel is closing", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      other_actor = actor_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/actors/#{other_actor}")
+
+      render_click(lv, "close_panel")
+      assert_patch(lv, ~p"/#{account}/actors")
+
+      render_click(lv, "change_tab", %{"tab" => "groups"})
+
+      refute has_element?(lv, "#actor-panel > div")
+    end
+
     test "shows identities tab content", %{conn: conn, account: account, actor: actor} do
       other_actor = actor_fixture(account: account)
 
@@ -445,6 +466,37 @@ defmodule PortalWeb.ActorsTest do
       assert html =~ token.id
     end
 
+    test "marks a client token online when its device joins the account presence", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      other_actor = actor_fixture(account: account)
+      token = client_token_fixture(account: account, actor: other_actor)
+      client = client_fixture(account: account, actor: other_actor)
+
+      {:ok, lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/actors/#{other_actor}?tab=client_sessions")
+
+      assert html =~ "Offline"
+      refute html =~ "Online"
+
+      :ok = Portal.Presence.Devices.connect(client, token.id)
+
+      send(lv.pid, %Phoenix.Socket.Broadcast{
+        topic: "presences:account_devices:#{account.id}",
+        event: "presence_diff",
+        payload: %{
+          joins: %{client.id => %{metas: [%{actor_id: other_actor.id, token_id: token.id}]}},
+          leaves: %{}
+        }
+      })
+
+      assert render(lv) =~ "Online"
+    end
+
     test "shows portal session details in the portal sessions tab", %{
       conn: conn,
       account: account,
@@ -517,6 +569,44 @@ defmodule PortalWeb.ActorsTest do
       html = render_click(lv, "enable", %{"id" => other_actor.id})
       refute html =~ "Enable"
       assert html =~ "Disable"
+    end
+
+    test "does not re-enable actor when users limit is reached", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      account = update_account(account, %{limits: %{users_count: 1}})
+      other_actor = disabled_actor_fixture(account: account, type: :account_user)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/actors/#{other_actor}")
+
+      html = render_click(lv, "enable", %{"id" => other_actor.id})
+
+      assert html =~ "User limit reached for your account"
+      assert Portal.Repo.get_by!(Portal.Actor, id: other_actor.id).is_disabled
+    end
+
+    test "does not re-enable admin when admins limit is reached", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      account = update_account(account, %{limits: %{account_admin_users_count: 1}})
+      other_actor = disabled_actor_fixture(account: account, type: :account_admin_user)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/actors/#{other_actor}")
+
+      html = render_click(lv, "enable", %{"id" => other_actor.id})
+
+      assert html =~ "Admin user limit reached for your account"
+      assert Portal.Repo.get_by!(Portal.Actor, id: other_actor.id).is_disabled
     end
 
     test "cancel delete actor returns to detail view", %{
@@ -1477,7 +1567,11 @@ defmodule PortalWeb.ActorsTest do
       assert html =~ "Total"
     end
 
-    test "ignores service account changes", %{conn: conn, account: account, actor: actor} do
+    test "ignores user actor update changes without warning", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
       {:ok, lv, _html} =
         conn
         |> authorize_conn(actor)
@@ -1485,7 +1579,40 @@ defmodule PortalWeb.ActorsTest do
 
       render_async(lv)
 
-      send(lv.pid, %Change{op: :insert, struct: %Actor{type: :service_account}})
+      log =
+        capture_log(fn ->
+          send(lv.pid, %Change{op: :update, struct: %Actor{type: :account_user}})
+          render(lv)
+        end)
+
+      refute log =~ "Unhandled handle_info message in LiveView"
+
+      html = render(lv)
+      assert html =~ "1"
+      assert html =~ "Total"
+    end
+
+    test "quietly ignores other actor types on the shared topic", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/actors")
+
+      render_async(lv)
+
+      log =
+        capture_log(fn ->
+          send(lv.pid, %Change{op: :insert, struct: %Actor{type: :service_account}})
+          send(lv.pid, %Change{op: :update, struct: %Actor{type: :api_client}})
+          send(lv.pid, %Change{op: :delete, old_struct: %Actor{type: :service_account}})
+          render(lv)
+        end)
+
+      refute log =~ "Unhandled handle_info message in LiveView"
 
       html = render(lv)
       assert html =~ "1"
@@ -1508,6 +1635,95 @@ defmodule PortalWeb.ActorsTest do
       render(lv)
 
       refute_receive {:DOWN, ^ref, :process, ^pid, _reason}, 500
+    end
+  end
+  describe "live table filters across panel operations" do
+    setup %{account: account} do
+      matching = actor_fixture(account: account, name: "Johnny Appleseed")
+      other = actor_fixture(account: account, name: "Zelda Fitzgerald")
+      filter = %{"actors_filter[name_or_email]" => "johnny"}
+      %{matching: matching, other: other, filter: filter}
+    end
+
+    test "are kept when creating a user", %{
+      conn: conn,
+      account: account,
+      actor: actor,
+      other: other,
+      filter: filter
+    } do
+      {:ok, lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/actors?#{filter}")
+
+      refute html =~ other.name
+
+      render_click(lv, "open_new_actor_panel")
+      assert_patch(lv, ~p"/#{account}/actors/new?#{filter}")
+
+      render_click(lv, "close_panel")
+      assert_patch(lv, ~p"/#{account}/actors?#{filter}")
+
+      render_click(lv, "open_new_actor_panel")
+      render_click(lv, "select_new_actor_type", %{"type" => "user"})
+
+      lv
+      |> form("form[phx-submit='create_user']",
+        actor: %{
+          name: "Johnny Cash",
+          email: "johnny.cash@example.com",
+          type: "account_user",
+          allow_email_otp_sign_in: "true"
+        }
+      )
+      |> render_submit()
+
+      created = Portal.Repo.get_by!(Actor, account_id: account.id, name: "Johnny Cash")
+      assert_patch(lv, ~p"/#{account}/actors/#{created.id}?#{filter}")
+
+      html = render(lv)
+      assert html =~ "Johnny Cash"
+      refute html =~ other.name
+    end
+
+    test "are kept when editing a user", %{
+      conn: conn,
+      account: account,
+      actor: actor,
+      matching: matching,
+      other: other,
+      filter: filter
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/actors/#{matching}?#{filter}")
+
+      render_click(lv, "open_actor_edit_form")
+      assert_patch(lv, ~p"/#{account}/actors/#{matching}/edit?#{filter}")
+
+      render_click(lv, "cancel_actor_edit_form")
+      assert_patch(lv, ~p"/#{account}/actors/#{matching}?#{filter}")
+
+      render_click(lv, "open_actor_edit_form")
+
+      lv
+      |> form("form[phx-submit='save']",
+        actor: %{
+          name: "Johnny Renamed",
+          email: matching.email,
+          type: "account_user",
+          allow_email_otp_sign_in: "true"
+        }
+      )
+      |> render_submit()
+
+      assert_patch(lv, ~p"/#{account}/actors/#{matching}?#{filter}")
+
+      html = render(lv)
+      assert html =~ "Johnny Renamed"
+      refute html =~ other.name
     end
   end
 end

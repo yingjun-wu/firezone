@@ -1,8 +1,6 @@
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import { defineConfig, Plugin } from "vite";
-import flowbiteReact from "flowbite-react/plugin/vite";
-import typescript from "vite-plugin-typescript";
 import { execSync } from "child_process";
 import { writeFileSync } from "fs";
 import { join } from "path";
@@ -24,17 +22,11 @@ const gitVersion =
 
 // https://vite.dev/config/
 export default defineConfig({
-  plugins: [
-    react(),
-    flowbiteReact(),
-    tailwindcss(),
-    typescript(),
-    preserveGitkeep(),
-  ],
+  plugins: [react(), tailwindcss(), preserveGitkeep()],
 
   define: {
     // mark:next-gui-version
-    __APP_VERSION__: JSON.stringify("1.5.16"),
+    __APP_VERSION__: JSON.stringify("1.5.19"),
     __GIT_VERSION__: JSON.stringify(gitVersion),
   },
 

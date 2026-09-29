@@ -100,9 +100,14 @@ defmodule Portal.Billing do
   Returns the plan type for the account based on the Stripe product name.
   Returns :enterprise, :team, :starter, or :unknown.
   """
-  @spec plan_type(Portal.Account.t()) :: :enterprise | :team | :starter | :unknown
-  def plan_type(%Portal.Account{metadata: %{stripe: %{product_name: product_name}}})
-      when is_binary(product_name) do
+  @spec plan_type(Portal.Account.t() | String.t() | nil) ::
+          :enterprise | :team | :starter | :unknown
+  def plan_type(%Portal.Account{metadata: %{stripe: %{product_name: product_name}}}),
+    do: plan_type(product_name)
+
+  def plan_type(%Portal.Account{}), do: :unknown
+
+  def plan_type(product_name) when is_binary(product_name) do
     cond do
       String.starts_with?(product_name, "Enterprise") -> :enterprise
       product_name == "Team" -> :team
@@ -111,7 +116,7 @@ defmodule Portal.Billing do
     end
   end
 
-  def plan_type(%Portal.Account{}), do: :unknown
+  def plan_type(nil), do: :unknown
 
   @spec paid_plan?(Portal.Account.t()) :: boolean()
   def paid_plan?(%Portal.Account{} = account), do: plan_type(account) in [:team, :enterprise]
@@ -195,6 +200,50 @@ defmodule Portal.Billing do
     Portal.Account.active?(account) and
       (is_nil(account.limits.api_clients_count) or
          api_clients_count < account.limits.api_clients_count)
+  end
+
+  @type actor_enable_limit_error ::
+          :users_limit_reached
+          | :admin_users_limit_reached
+          | :service_accounts_limit_reached
+          | :api_clients_limit_reached
+
+  @doc """
+  Checks whether an actor can be enabled without exceeding its account's billing limits.
+  """
+  @spec check_actor_enable_limits(Portal.Account.t(), Portal.Actor.t()) ::
+          :ok | {:error, actor_enable_limit_error()}
+  def check_actor_enable_limits(%Portal.Account{} = account, %Portal.Actor{
+        type: :account_admin_user
+      }) do
+    cond do
+      not can_create_users?(account) ->
+        {:error, :users_limit_reached}
+
+      not can_create_admin_users?(account) ->
+        {:error, :admin_users_limit_reached}
+
+      true ->
+        :ok
+    end
+  end
+
+  def check_actor_enable_limits(%Portal.Account{} = account, %Portal.Actor{
+        type: :account_user
+      }) do
+    if can_create_users?(account), do: :ok, else: {:error, :users_limit_reached}
+  end
+
+  def check_actor_enable_limits(%Portal.Account{} = account, %Portal.Actor{
+        type: :service_account
+      }) do
+    if can_create_service_accounts?(account),
+      do: :ok,
+      else: {:error, :service_accounts_limit_reached}
+  end
+
+  def check_actor_enable_limits(%Portal.Account{} = account, %Portal.Actor{type: :api_client}) do
+    if can_create_api_clients?(account), do: :ok, else: {:error, :api_clients_limit_reached}
   end
 
   def api_tokens_limit_exceeded?(%Portal.Account{} = account, api_tokens_count) do
@@ -477,6 +526,59 @@ defmodule Portal.Billing do
     false
   end
 
+  # Everything sign-up gives a new account, for one that predates it or was created some
+  # other way. Each step is skipped when the row is already there, so it is safe to re-run.
+  defp ensure_defaults_exist(%Portal.Account{} = account) do
+    with {:ok, account} <- ensure_internet_site_and_resource_exist(account) do
+      ensure_self_device_pool_exists(account)
+    end
+  end
+
+  defp ensure_self_device_pool_exists(%Portal.Account{} = account) do
+    pool =
+      case Database.fetch_self_device_pool(account) do
+        {:ok, pool} ->
+          pool
+
+        {:error, :not_found} ->
+          {:ok, pool} = Database.create_self_device_pool(account)
+          pool
+      end
+
+    group =
+      case Database.fetch_account_owner_group(account) do
+        {:ok, group} ->
+          group
+
+        {:error, :not_found} ->
+          {:ok, group} = Database.create_account_owner_group(account)
+          group
+      end
+
+    :ok = ensure_account_owner_membership_exists(account, group)
+
+    case Database.fetch_self_device_pool_policy(account, group, pool) do
+      {:ok, _policy} ->
+        {:ok, account}
+
+      {:error, :not_found} ->
+        {:ok, _policy} = Database.create_self_device_pool_policy(account, group, pool)
+        {:ok, account}
+    end
+  end
+
+  # The account's oldest admin is the closest thing an existing account has to the actor who
+  # created it. An account without one is left alone; the group is there for the first admin.
+  defp ensure_account_owner_membership_exists(%Portal.Account{} = account, group) do
+    with {:ok, actor} <- Database.fetch_oldest_admin(account),
+         {:error, :not_found} <- Database.fetch_membership(account, group, actor) do
+      {:ok, _membership} = Database.create_membership(account, group, actor)
+      :ok
+    else
+      _other -> :ok
+    end
+  end
+
   defp ensure_internet_site_and_resource_exist(%Portal.Account{} = account) do
     # Ensure Internet site exists
     site =
@@ -546,13 +648,13 @@ defmodule Portal.Billing do
   def provision_account(%Portal.Account{} = account) do
     with true <- enabled?(),
          true <- not account_provisioned?(account),
-         {:ok, account} <- ensure_internet_site_and_resource_exist(account),
+         {:ok, account} <- ensure_defaults_exist(account),
          {:ok, account} <- create_customer(account),
          {:ok, account} <- create_subscription(account) do
       {:ok, account}
     else
       false ->
-        ensure_internet_site_and_resource_exist(account)
+        ensure_defaults_exist(account)
 
       {:error, reason} ->
         {:error, reason}
@@ -658,82 +760,78 @@ defmodule Portal.Billing do
       |> Safe.update()
     end
 
-    def count_users_for_account(%Account{} = account, repo \\ :replica) do
+    def count_users_for_account(%Account{} = account) do
       from(a in Actor,
         where: a.account_id == ^account.id,
-        where: is_nil(a.disabled_at),
+        where: a.is_disabled == false,
         where: a.type in [:account_admin_user, :account_user]
       )
-      |> Safe.unscoped(repo)
+      |> Safe.unscoped()
       |> Safe.aggregate(:count)
     end
 
-    def count_service_accounts_for_account(%Account{} = account, repo \\ :replica) do
+    def count_service_accounts_for_account(%Account{} = account) do
       from(a in Actor,
         where: a.account_id == ^account.id,
-        where: is_nil(a.disabled_at),
+        where: a.is_disabled == false,
         where: a.type == :service_account
       )
-      |> Safe.unscoped(repo)
+      |> Safe.unscoped()
       |> Safe.aggregate(:count)
     end
 
-    def count_account_admin_users_for_account(%Account{} = account, repo \\ :replica) do
+    def count_account_admin_users_for_account(%Account{} = account) do
       from(a in Actor,
         where: a.account_id == ^account.id,
-        where: is_nil(a.disabled_at),
+        where: a.is_disabled == false,
         where: a.type == :account_admin_user
       )
-      |> Safe.unscoped(repo)
+      |> Safe.unscoped()
       |> Safe.aggregate(:count)
     end
 
-    def count_1m_active_users_for_account(%Account{} = account, repo \\ :replica) do
-      from(c in Device, as: :clients)
-      |> where([clients: c], c.type == :client)
-      |> where([clients: c], c.account_id == ^account.id)
-      |> join(:inner, [clients: c], s in Portal.ClientSession,
-        on: s.device_id == c.id and s.account_id == c.account_id,
-        as: :session
-      )
-      |> where([session: s], s.inserted_at > ago(1, "month"))
-      |> join(:inner, [clients: c], a in Actor,
-        on: c.actor_id == a.id and c.account_id == a.account_id,
+    def count_1m_active_users_for_account(%Account{} = account) do
+      from(d in Device, as: :devices)
+      |> where([devices: d], d.type == :client)
+      |> where([devices: d], d.account_id == ^account.id)
+      |> where([devices: d], d.last_seen_at > ago(1, "month"))
+      |> join(:inner, [devices: d], a in Actor,
+        on: d.actor_id == a.id and d.account_id == a.account_id,
         as: :actor
       )
-      |> where([actor: a], is_nil(a.disabled_at))
+      |> where([actor: a], a.is_disabled == false)
       |> where([actor: a], a.type in [:account_user, :account_admin_user])
-      |> select([clients: c], c.actor_id)
+      |> select([devices: d], d.actor_id)
       |> distinct(true)
-      |> Safe.unscoped(repo)
+      |> Safe.unscoped()
       |> Safe.aggregate(:count)
     end
 
-    def count_sites_for_account(account, repo \\ :replica) do
+    def count_sites_for_account(account) do
       from(g in Portal.Site,
         where: g.account_id == ^account.id,
         where: g.managed_by == :account
       )
-      |> Safe.unscoped(repo)
+      |> Safe.unscoped()
       |> Safe.aggregate(:count)
     end
 
-    def count_api_clients_for_account(%Account{} = account, repo \\ :replica) do
+    def count_api_clients_for_account(%Account{} = account) do
       from(a in Actor,
         where: a.account_id == ^account.id,
-        where: is_nil(a.disabled_at),
+        where: a.is_disabled == false,
         where: a.type == :api_client
       )
-      |> Safe.unscoped(repo)
+      |> Safe.unscoped()
       |> Safe.aggregate(:count)
     end
 
-    def count_api_tokens_for_actor(%Actor{} = actor, repo \\ :replica) do
+    def count_api_tokens_for_actor(%Actor{} = actor) do
       from(t in Portal.APIToken,
         where: t.actor_id == ^actor.id,
         where: t.account_id == ^actor.account_id
       )
-      |> Safe.unscoped(repo)
+      |> Safe.unscoped()
       |> Safe.aggregate(:count)
     end
 
@@ -744,8 +842,8 @@ defmodule Portal.Billing do
           where: s.name == "Internet",
           where: s.managed_by == :system
         )
-        |> Safe.unscoped(:replica)
-        |> Safe.one(fallback_to_primary: true)
+        |> Safe.unscoped()
+        |> Safe.one()
 
       case result do
         nil -> {:error, :not_found}
@@ -769,8 +867,8 @@ defmodule Portal.Billing do
           where: r.account_id == ^account.id,
           where: r.type == :internet
         )
-        |> Safe.unscoped(:replica)
-        |> Safe.one(fallback_to_primary: true)
+        |> Safe.unscoped()
+        |> Safe.one()
 
       case result do
         nil -> {:error, :not_found}
@@ -785,6 +883,120 @@ defmodule Portal.Billing do
         type: :internet,
         site_id: site.id
       }
+      |> Safe.unscoped()
+      |> Safe.insert()
+    end
+
+    def fetch_self_device_pool(%Account{} = account) do
+      from(r in Portal.Resource,
+        where: r.account_id == ^account.id,
+        where: r.type == :device_pool
+      )
+      |> Safe.unscoped()
+      |> Safe.one()
+      |> case do
+        nil -> {:error, :not_found}
+        resource -> {:ok, resource}
+      end
+    end
+
+    def create_self_device_pool(%Account{} = account) do
+      %Portal.Resource{account_id: account.id}
+      |> Ecto.Changeset.cast(Portal.Resource.self_device_pool_attrs(), [
+        :type,
+        :device_membership_criteria,
+        :name
+      ])
+      |> Portal.Resource.changeset()
+      |> Safe.unscoped()
+      |> Safe.insert()
+    end
+
+    def fetch_account_owner_group(%Account{} = account) do
+      %{name: name} = Portal.Group.account_owner_attrs()
+
+      from(g in Portal.Group,
+        where: g.account_id == ^account.id,
+        where: g.name == ^name
+      )
+      |> Safe.unscoped()
+      |> Safe.one()
+      |> case do
+        nil -> {:error, :not_found}
+        group -> {:ok, group}
+      end
+    end
+
+    def create_account_owner_group(%Account{} = account) do
+      %Portal.Group{account_id: account.id}
+      |> Ecto.Changeset.cast(Portal.Group.account_owner_attrs(), [:name, :type])
+      |> Portal.Group.changeset()
+      |> Safe.unscoped()
+      |> Safe.insert()
+    end
+
+    def fetch_self_device_pool_policy(%Account{} = account, group, resource) do
+      from(p in Portal.Policy,
+        where: p.account_id == ^account.id,
+        where: p.group_id == ^group.id,
+        where: p.resource_id == ^resource.id
+      )
+      |> Safe.unscoped()
+      |> Safe.one()
+      |> case do
+        nil -> {:error, :not_found}
+        policy -> {:ok, policy}
+      end
+    end
+
+    def create_self_device_pool_policy(%Account{} = account, group, resource) do
+      %Portal.Policy{account_id: account.id}
+      |> Ecto.Changeset.cast(
+        %{
+          group_id: group.id,
+          resource_id: resource.id,
+          description: "Lets the account owner reach their own devices."
+        },
+        [:group_id, :resource_id, :description]
+      )
+      |> Portal.Policy.changeset()
+      |> Safe.unscoped()
+      |> Safe.insert()
+    end
+
+    def fetch_oldest_admin(%Account{} = account) do
+      from(a in Portal.Actor,
+        where: a.account_id == ^account.id,
+        where: a.type == :account_admin_user,
+        order_by: [asc: a.inserted_at, asc: a.id],
+        limit: 1
+      )
+      |> Safe.unscoped()
+      |> Safe.one()
+      |> case do
+        nil -> {:error, :not_found}
+        actor -> {:ok, actor}
+      end
+    end
+
+    def fetch_membership(%Account{} = account, group, actor) do
+      from(m in Portal.Membership,
+        where: m.account_id == ^account.id,
+        where: m.group_id == ^group.id,
+        where: m.actor_id == ^actor.id
+      )
+      |> Safe.unscoped()
+      |> Safe.one()
+      |> case do
+        nil -> {:error, :not_found}
+        membership -> {:ok, membership}
+      end
+    end
+
+    def create_membership(%Account{} = account, group, actor) do
+      %Portal.Membership{account_id: account.id}
+      |> Ecto.Changeset.cast(%{group_id: group.id, actor_id: actor.id}, [:group_id, :actor_id])
+      |> Portal.Membership.changeset()
       |> Safe.unscoped()
       |> Safe.insert()
     end

@@ -5,8 +5,10 @@ defmodule PortalWeb.Settings.AuthenticationTest do
   import Portal.AccountFixtures
   import Portal.ActorFixtures
   import Portal.AuthProviderFixtures
+  import Portal.FeaturesFixtures
   import Portal.TokenFixtures
   import Portal.PortalSessionFixtures
+  import Portal.TrustAnchorFixtures
 
   alias Portal.EmailOTP
   alias PortalWeb.Mocks
@@ -16,9 +18,6 @@ defmodule PortalWeb.Settings.AuthenticationTest do
   # =============================================================================
 
   setup do
-    # Clear the OpenIDConnect document cache to ensure fresh state for each test
-    OpenIDConnect.Document.Cache.clear()
-
     account = account_fixture()
     actor = admin_actor_fixture(account: account)
 
@@ -66,6 +65,27 @@ defmodule PortalWeb.Settings.AuthenticationTest do
     |> Floki.text(sep: " ")
     |> String.replace(~r/\s+/, " ")
     |> String.trim()
+  end
+
+  defp verification_ref_from_open_url(lv) do
+    assert_push_event(lv, "open_url", %{url: url})
+
+    %{"state" => state} =
+      url
+      |> URI.parse()
+      |> Map.fetch!(:query)
+      |> URI.decode_query()
+
+    assert {:ok, %{verification_ref: verification_ref, lv_pid: serialized_pid}} =
+             PortalWeb.OIDC.verify_verification_state(state)
+
+    assert PortalWeb.OIDC.deserialize_pid(serialized_pid) == lv.pid
+
+    send(lv.pid, {:get_pending_verification, self()})
+
+    assert_receive {:pending_verification, %{verification_ref: ^verification_ref}}
+
+    verification_ref
   end
 
   # =============================================================================
@@ -117,6 +137,19 @@ defmodule PortalWeb.Settings.AuthenticationTest do
       assert Floki.text(add_button) =~ "Add"
     end
 
+    test "renders authentication documentation link", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      assert html =~ "https://www.firezone.dev/kb/authenticate?utm_source=product#"
+    end
+
     test "renders make default option for providers", %{
       account: account,
       actor: actor,
@@ -138,6 +171,71 @@ defmodule PortalWeb.Settings.AuthenticationTest do
   # =============================================================================
 
   describe "provider listing" do
+    test "renders X.509 with a trust-anchor warning when the feature is enabled", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      enable_feature(:x509_auth)
+      provider = x509_provider_fixture(account: account)
+
+      {:ok, lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      assert html =~ "X.509"
+      assert html =~ "No devices will be able to use this authentication provider"
+
+      row_text = provider_row_text(html, provider.id)
+      assert row_text =~ "0 client"
+      refute row_text =~ "0 portal"
+
+      assert has_element?(
+               lv,
+               "a[href='/#{account.slug}/settings/trust_anchors']",
+               "Trust Anchors"
+             )
+
+      actions = open_provider_actions(lv, provider.id)
+      refute actions =~ "Make default"
+      refute has_provider_action_button?(actions, "delete", provider.id)
+      refute actions =~ "/authentication/x509/#{provider.id}/edit"
+    end
+
+    test "does not warn for X.509 when the account has a trust anchor", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      enable_feature(:x509_auth)
+      _provider = x509_provider_fixture(account: account)
+      _anchor = trust_anchor_fixture(account: account)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      assert html =~ "X.509"
+      refute html =~ "No devices will be able to use this authentication provider"
+    end
+
+    test "hides X.509 when X.509 authentication is globally disabled", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      _provider = x509_provider_fixture(account: account)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      refute html =~ "X.509"
+    end
+
     test "renders email_otp provider", %{account: account, actor: actor, conn: conn} do
       # authorize_conn creates an email_otp provider
       {:ok, _lv, html} =
@@ -417,6 +515,8 @@ defmodule PortalWeb.Settings.AuthenticationTest do
       assert html =~ "Context"
       assert html =~ "Portal (seconds)"
       assert html =~ "Client (seconds)"
+      assert html =~ "Clients will be <strong>signed out</strong>"
+      assert html =~ "after this and forced to re-authenticate."
       assert html =~ "Verify Now"
     end
 
@@ -1277,6 +1377,29 @@ defmodule PortalWeb.Settings.AuthenticationTest do
 
       # The email_otp provider shouldn't have a delete button
       assert Enum.empty?(delete_buttons)
+    end
+
+    test "X.509 providers cannot be deleted even with a forged event", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      enable_feature(:x509_auth)
+      provider = x509_provider_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      render_hook(lv, "delete_provider", %{"id" => provider.id})
+
+      assert render(lv) =~ "Failed to delete authentication provider"
+
+      assert Repo.get_by!(Portal.X509.AuthProvider,
+               account_id: account.id,
+               id: provider.id
+             )
     end
 
     test "userpass providers cannot be deleted via UI", %{
@@ -2279,7 +2402,6 @@ defmodule PortalWeb.Settings.AuthenticationTest do
 
   describe "start_verification error handling" do
     test "handles connection refused error", %{account: account, actor: actor, conn: conn} do
-      OpenIDConnect.Document.Cache.clear()
       Mocks.OIDC.stub_connection_refused()
 
       {:ok, lv, _html} =
@@ -2307,7 +2429,6 @@ defmodule PortalWeb.Settings.AuthenticationTest do
     end
 
     test "handles HTTP 404 error", %{account: account, actor: actor, conn: conn} do
-      OpenIDConnect.Document.Cache.clear()
       Mocks.OIDC.stub_discovery_error(404, "Not Found")
 
       {:ok, lv, _html} =
@@ -2333,7 +2454,6 @@ defmodule PortalWeb.Settings.AuthenticationTest do
     end
 
     test "handles HTTP 500 error", %{account: account, actor: actor, conn: conn} do
-      OpenIDConnect.Document.Cache.clear()
       Mocks.OIDC.stub_discovery_error(500, "Internal Server Error")
 
       {:ok, lv, _html} =
@@ -2363,7 +2483,6 @@ defmodule PortalWeb.Settings.AuthenticationTest do
       actor: actor,
       conn: conn
     } do
-      OpenIDConnect.Document.Cache.clear()
       Mocks.OIDC.stub_invalid_json()
 
       {:ok, lv, _html} =
@@ -2676,6 +2795,141 @@ defmodule PortalWeb.Settings.AuthenticationTest do
 
       html = render(lv)
       assert html =~ "Verified"
+    end
+
+    test "peeks at an Entra verifier without consuming it before the code callback", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/entra/new")
+
+      lv
+      |> form("#auth-provider-form", %{auth_provider: %{name: "Test Entra"}})
+      |> render_change()
+
+      lv |> element("#verify-button") |> render_click()
+      assert_push_event(lv, "open_url", %{url: url})
+
+      %{"state" => state} = url |> URI.parse() |> Map.fetch!(:query) |> URI.decode_query()
+
+      assert {:ok, %{verification_ref: verification_ref}} =
+               PortalWeb.OIDC.verify_verification_state(state)
+
+      send(lv.pid, {:peek_pending_verification, self()})
+      assert_receive {:pending_verification, %{verification_ref: ^verification_ref}}
+
+      send(lv.pid, {:get_pending_verification, self()})
+      assert_receive {:pending_verification, %{verification_ref: ^verification_ref}}
+    end
+
+    test "does not consume an Entra verifier for a stale callback reference", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/entra/new")
+
+      lv
+      |> form("#auth-provider-form", %{auth_provider: %{name: "Test Entra"}})
+      |> render_change()
+
+      lv |> element("#verify-button") |> render_click()
+      assert_push_event(lv, "open_url", %{url: url})
+
+      %{"state" => state} = url |> URI.parse() |> Map.fetch!(:query) |> URI.decode_query()
+
+      assert {:ok, %{verification_ref: verification_ref}} =
+               PortalWeb.OIDC.verify_verification_state(state)
+
+      send(lv.pid, {:get_pending_verification, Ecto.UUID.generate(), self()})
+      assert_receive {:pending_verification, nil}
+
+      send(lv.pid, {:peek_pending_verification, self()})
+      assert_receive {:pending_verification, %{verification_ref: ^verification_ref}}
+    end
+
+    test "accepts only the active entra verification completion", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/entra/new")
+
+      lv
+      |> form("#auth-provider-form", %{auth_provider: %{name: "Test Entra"}})
+      |> render_change()
+
+      lv |> element("#verify-button") |> render_click()
+      stale_ref = verification_ref_from_open_url(lv)
+
+      lv |> element("#verify-button") |> render_click()
+      current_ref = verification_ref_from_open_url(lv)
+
+      stale_ack_ref = make_ref()
+
+      send(
+        lv.pid,
+        {:entra_verify_complete, "https://login.microsoftonline.com/stale/v2.0", "stale",
+         stale_ref, {self(), stale_ack_ref}}
+      )
+
+      assert_receive {:verification_ack, ^stale_ack_ref}
+      refute render(lv) =~ "Verified"
+
+      current_ack_ref = make_ref()
+
+      send(
+        lv.pid,
+        {:entra_verify_complete, "https://login.microsoftonline.com/current/v2.0", "current",
+         current_ref, {self(), current_ack_ref}}
+      )
+
+      assert_receive {:verification_ack, ^current_ack_ref}
+      assert render(lv) =~ "Verified"
+    end
+
+    test "ignores entra completion after navigating to another provider form", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/entra/new")
+
+      lv
+      |> form("#auth-provider-form", %{auth_provider: %{name: "Test Entra"}})
+      |> render_change()
+
+      lv |> element("#verify-button") |> render_click()
+      verification_ref = verification_ref_from_open_url(lv)
+
+      render_patch(lv, ~p"/#{account}/settings/authentication/google/new")
+
+      ack_ref = make_ref()
+
+      send(
+        lv.pid,
+        {:entra_verify_complete, "https://login.microsoftonline.com/stale/v2.0", "stale",
+         verification_ref, {self(), ack_ref}}
+      )
+
+      assert_receive {:verification_ack, ^ack_ref}
+
+      html = render(lv)
+      assert html =~ "Add Google Provider"
+      refute html =~ "Verified"
     end
 
     test "handles entra provider verification setup via bypass", %{
@@ -3181,10 +3435,11 @@ defmodule PortalWeb.Settings.AuthenticationTest do
 
       # Start verification
       lv |> element("#verify-button") |> render_click()
+      verification_ref = verification_ref_from_open_url(lv)
 
       lv_pid = lv.pid
 
-      send(lv_pid, {:verification_failed, "Admin consent error"})
+      send(lv_pid, {:verification_failed, "Admin consent error", verification_ref})
       html = render(lv)
       assert html =~ "Verification failed"
     end
@@ -3457,7 +3712,6 @@ defmodule PortalWeb.Settings.AuthenticationTest do
       actor: actor,
       conn: conn
     } do
-      OpenIDConnect.Document.Cache.clear()
       Mocks.OIDC.stub_discovery_error(418, JSON.encode!(%{"error" => "teapot"}))
 
       {:ok, lv, _html} =
@@ -3487,7 +3741,6 @@ defmodule PortalWeb.Settings.AuthenticationTest do
       actor: actor,
       conn: conn
     } do
-      OpenIDConnect.Document.Cache.clear()
       Mocks.OIDC.stub_invalid_json("{")
 
       {:ok, lv, _html} =
@@ -3517,7 +3770,6 @@ defmodule PortalWeb.Settings.AuthenticationTest do
       actor: actor,
       conn: conn
     } do
-      OpenIDConnect.Document.Cache.clear()
       Mocks.OIDC.stub_connection_refused()
 
       {:ok, lv, _html} =
@@ -3549,7 +3801,6 @@ defmodule PortalWeb.Settings.AuthenticationTest do
       actor: actor,
       conn: conn
     } do
-      OpenIDConnect.Document.Cache.clear()
       Mocks.OIDC.stub_dns_error()
 
       {:ok, lv, _html} =
@@ -3581,7 +3832,6 @@ defmodule PortalWeb.Settings.AuthenticationTest do
       actor: actor,
       conn: conn
     } do
-      OpenIDConnect.Document.Cache.clear()
       Mocks.OIDC.stub_discovery_error(418, "I'm a teapot")
 
       {:ok, lv, _html} =
@@ -3628,6 +3878,7 @@ defmodule PortalWeb.Settings.AuthenticationTest do
 
       # Start verification
       lv |> element("#verify-button") |> render_click()
+      verification_ref = verification_ref_from_open_url(lv)
 
       # Wait for the verification to be set up
       html = render(lv)
@@ -3638,7 +3889,7 @@ defmodule PortalWeb.Settings.AuthenticationTest do
       send(
         lv_pid,
         {:entra_verify_complete, "https://login.microsoftonline.com/test_tenant/v2.0",
-         "test_tenant"}
+         "test_tenant", verification_ref, nil}
       )
 
       html = render(lv)
@@ -3773,7 +4024,6 @@ defmodule PortalWeb.Settings.AuthenticationTest do
       actor: actor,
       conn: conn
     } do
-      OpenIDConnect.Document.Cache.clear()
       Mocks.OIDC.stub_invalid_json("{")
 
       {:ok, lv, _html} =
@@ -3803,7 +4053,6 @@ defmodule PortalWeb.Settings.AuthenticationTest do
       actor: actor,
       conn: conn
     } do
-      OpenIDConnect.Document.Cache.clear()
       Mocks.OIDC.stub_invalid_json(<<255, 254, 253>>)
 
       {:ok, lv, _html} =
@@ -3833,7 +4082,6 @@ defmodule PortalWeb.Settings.AuthenticationTest do
       actor: actor,
       conn: conn
     } do
-      OpenIDConnect.Document.Cache.clear()
       Mocks.OIDC.stub_discovery_error(401, "Unauthorized")
 
       {:ok, lv, _html} =
@@ -3863,7 +4111,6 @@ defmodule PortalWeb.Settings.AuthenticationTest do
       actor: actor,
       conn: conn
     } do
-      OpenIDConnect.Document.Cache.clear()
       Mocks.OIDC.stub_dns_error()
 
       {:ok, lv, _html} =

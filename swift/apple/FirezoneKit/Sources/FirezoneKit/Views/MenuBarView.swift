@@ -5,6 +5,7 @@
 //
 
 #if os(macOS)
+  import Foundation
   import NetworkExtension
   import SwiftUI
 
@@ -63,6 +64,17 @@
         Text("Loading VPN configurations from system settings…")
           .foregroundStyle(.secondary)
 
+      case .disconnected where store.systemExtensionStatus == .needsInstall:
+        // An MDM profile can hand us a configuration before the extension exists.
+        Button("Enable the system extension to sign in…") {
+          installSystemExtension()
+        }
+
+      case .disconnected where store.systemExtensionStatus == .needsReboot:
+        // Signing in would run against whichever version the system still has.
+        Text("Restart your Mac to finish updating Firezone…")
+          .foregroundStyle(.secondary)
+
       case .disconnected:
         Button("Sign In") {
           signIn()
@@ -74,7 +86,7 @@
 
       case .connected, .reasserting, .connecting:
         Group {
-          Text("Signed in as \(store.actorName)")
+          Text(store.sessionHeading)
             .foregroundStyle(.secondary)
 
           Button("Sign Out") {
@@ -103,6 +115,17 @@
       Task {
         do {
           try await store.signOut()
+        } catch {
+          Log.error(error)
+          MacOSAlert.show(for: error)
+        }
+      }
+    }
+
+    func installSystemExtension() {
+      Task {
+        do {
+          try await store.installSystemExtension()
         } catch {
           Log.error(error)
           MacOSAlert.show(for: error)
