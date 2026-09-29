@@ -35,6 +35,8 @@ mod packet_kind;
 mod peer_store;
 mod portal_connection;
 #[cfg(test)]
+mod test_utils;
+#[cfg(test)]
 mod proptest;
 mod routing_table;
 mod unique_packet_buffer;
