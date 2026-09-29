@@ -417,6 +417,17 @@ impl ClientState {
         }
     }
 
+    /// Configure the device domain before processing DNS queries.
+    pub fn set_device_domain(&mut self, domain: DomainName) -> anyhow::Result<()> {
+        self.device_stub_resolver.set_device_domain(domain)
+    }
+
+    /// Invalidate device answers after a policy or directory change.
+    pub fn clear_device_dns_cache(&mut self) {
+        self.device_stub_resolver.clear_cache();
+        self.drain_device_stub_resolver_events();
+    }
+
     /// Handles the portal's answer to a device name.
     pub fn handle_device_domain_resolved(
         &mut self,

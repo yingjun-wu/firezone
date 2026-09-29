@@ -14,8 +14,23 @@ pub const DEVICE_DOMAIN: &str = "firezone.network";
 
 /// The slug of a device name, or `None` if `domain` is not one.
 pub fn device_slug(domain: &dns_types::DomainName) -> Option<String> {
-    let name = domain.to_string().to_lowercase();
-    let slug = name.strip_suffix(&format!(".{DEVICE_DOMAIN}"))?;
+    device_slug_in(domain, &DEVICE_DOMAIN.parse().expect("valid device domain"))
+}
+
+/// The slug under a host-configured device domain. Only one additional label matches.
+pub fn device_slug_in(
+    domain: &dns_types::DomainName,
+    device_domain: &dns_types::DomainName,
+) -> Option<String> {
+    let name = domain
+        .to_string()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    let suffix = device_domain
+        .to_string()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    let slug = name.strip_suffix(&format!(".{suffix}"))?;
 
     (!slug.is_empty() && !slug.contains('.')).then(|| slug.to_owned())
 }
