@@ -196,7 +196,22 @@ pub struct Guard {
     handle: Option<JoinHandle<()>>,
 }
 
+/// A nonblocking token sender sharing the report queue. Enqueue the token before
+/// installing an authorization, so its first report cannot overtake persistence.
+#[derive(Clone)]
+pub struct TokenWriter(mpsc::SyncSender<Command>);
+impl TokenWriter {
+    /// False means the bounded queue is full or the writer has stopped.
+    pub fn enqueue(&self, token: String) -> bool {
+        self.0.try_send(Command::Token(token)).is_ok()
+    }
+}
+
 impl Guard {
+    pub fn token_writer(&self) -> TokenWriter {
+        TokenWriter(self.tx.clone())
+    }
+
     /// Where this writer spools its reports, so an uploader can be pointed at
     /// the same place rather than told separately.
     pub fn spool_root(&self) -> &Path {
@@ -248,6 +263,7 @@ impl Guard {
 }
 
 enum Command {
+    Token(String),
     Write(Report),
     /// Explicit shutdown signal; the layer's sender clone lives in the global
     /// subscriber for the rest of the process, so the channel never closes.
@@ -422,6 +438,12 @@ fn writer_loop(root: &Path, rx: &mpsc::Receiver<Command>) {
 
     while let Ok(command) = rx.recv() {
         let report = match command {
+            Command::Token(token) => {
+                if write_token(root, &token).is_err() {
+                    tracing::warn!("Failed to persist flow-log ingest token");
+                }
+                continue;
+            }
             Command::Write(report) => report,
             Command::Shutdown => break,
         };
@@ -793,6 +815,18 @@ mod tests {
         assert!(start.get("actor_id").is_none()); // attribution rides the token only
         assert_eq!(end["rx_bytes"], 1024); // the `.end` is a self-describing report
         assert_eq!(end["inner_dst_port"], "443");
+    }
+
+    #[test]
+    fn queued_token_precedes_first_report() {
+        let root = tempfile::tempdir().unwrap();
+        let (layer, guard) = layer(root.path().to_owned());
+        assert!(guard.token_writer().enqueue(token_for(AUTHZ_ID)));
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || emit_event(false));
+        guard.join();
+        let dir = root.path().join("responder").join(AUTHZ_ID);
+        assert_eq!(std::fs::read_dir(dir).unwrap().count(), 2);
     }
 
     #[test]

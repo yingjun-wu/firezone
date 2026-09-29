@@ -41,6 +41,8 @@ type ConnectionDriver = Pin<Box<dyn Future<Output = ()> + Send>>;
 #[derive(Clone)]
 pub struct HttpClient {
     host: String,
+    port: u16,
+    scheme: &'static str,
     sender: Sender,
 
     #[expect(dead_code, reason = "We only need to keep it around.")]
@@ -82,8 +84,39 @@ impl HttpClient {
 
         Ok(Self {
             host,
+            port: 443,
+            scheme: "https",
             sender,
             connection: Arc::new(AbortOnDropHandle::new(connection)),
+        })
+    }
+
+    /// Connects to a local ingestion sidecar without TLS. Literal loopback
+    /// addresses only; public and private network addresses still require HTTPS.
+    pub async fn new_loopback_http(
+        address: SocketAddr,
+        socket_factory: Arc<dyn SocketFactory<TcpSocket>>,
+    ) -> Result<Self> {
+        anyhow::ensure!(address.ip().is_loopback(), "Plain HTTP requires loopback");
+        let stream = socket_factory.bind(address)?.connect(address).await?;
+        let (sender, connection) = hyper::client::conn::http1::Builder::new()
+            .handshake::<_, Full<Bytes>>(hyper_util::rt::TokioIo::new(stream))
+            .await?;
+        let task = tokio::spawn(async move {
+            if let Err(error) = connection.await {
+                tracing::debug!("Local HTTP connection failed: {error:#}");
+            }
+        });
+        let host = match address.ip() {
+            IpAddr::V4(ip) => ip.to_string(),
+            IpAddr::V6(ip) => format!("[{ip}]"),
+        };
+        Ok(Self {
+            host,
+            port: address.port(),
+            scheme: "http",
+            sender: Sender::H1(Arc::new(tokio::sync::Mutex::new(sender))),
+            connection: Arc::new(AbortOnDropHandle::new(task)),
         })
     }
 
@@ -105,8 +138,13 @@ impl HttpClient {
     ) -> Result<impl Future<Output = Result<http::Response<Bytes>>> + use<>> {
         anyhow::ensure!(!self.is_closed(), Closed);
         anyhow::ensure!(
-            request.uri().port_u16().is_none_or(|p| p == 443),
-            "Only supports requests to port 443"
+            request.uri().scheme_str() == Some(self.scheme)
+                && request
+                    .uri()
+                    .port_u16()
+                    .unwrap_or(if self.scheme == "https" { 443 } else { 80 })
+                    == self.port,
+            "Request origin does not match connection"
         );
 
         let host = request
@@ -144,8 +182,14 @@ impl HttpClient {
                     // `:authority` pseudo-header derived from the URI), so add it if
                     // the caller didn't.
                     if !request.headers().contains_key(http::header::HOST) {
-                        let value =
-                            http::HeaderValue::from_str(&host).context("Invalid host header")?;
+                        let value = http::HeaderValue::from_str(
+                            request
+                                .uri()
+                                .authority()
+                                .context("Missing authority")?
+                                .as_str(),
+                        )
+                        .context("Invalid host header")?;
                         request.headers_mut().insert(http::header::HOST, value);
                     }
 
@@ -291,6 +335,68 @@ mod tests {
     use std::net::IpAddr;
 
     use super::*;
+
+    #[tokio::test]
+    async fn loopback_http_preserves_port_and_rejects_other_origins() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        assert!(
+            HttpClient::new_loopback_http(
+                "192.0.2.1:8080".parse().unwrap(),
+                Arc::new(socket_factory::tcp)
+            )
+            .await
+            .is_err()
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = [0; 2048];
+            let n = stream.read(&mut bytes).await.unwrap();
+            assert!(
+                String::from_utf8_lossy(&bytes[..n])
+                    .to_lowercase()
+                    .contains(&format!("host: {address}"))
+            );
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let client = HttpClient::new_loopback_http(address, Arc::new(socket_factory::tcp))
+            .await
+            .unwrap();
+        for uri in [
+            format!("https://{address}/"),
+            "http://127.0.0.1:1/".into(),
+            format!("http://127.0.0.2:{}/", address.port()),
+        ] {
+            assert!(
+                client
+                    .send_request(
+                        http::Request::builder()
+                            .uri(uri)
+                            .body(Bytes::new())
+                            .unwrap()
+                    )
+                    .is_err()
+            );
+        }
+        let request = http::Request::builder()
+            .uri(format!("http://{address}/ingestion/flow_logs"))
+            .body(Bytes::new())
+            .unwrap();
+        assert_eq!(
+            client
+                .send_request(request)
+                .unwrap()
+                .await
+                .unwrap()
+                .status(),
+            http::StatusCode::NO_CONTENT
+        );
+        server.await.unwrap();
+    }
 
     #[tokio::test]
     #[ignore = "Requires Internet"]

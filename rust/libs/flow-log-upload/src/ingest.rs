@@ -115,6 +115,26 @@ async fn connect(
     url: &Url,
     socket_factory: Arc<dyn SocketFactory<TcpSocket>>,
 ) -> Result<HttpClient> {
+    if url.scheme() == "http" {
+        let address = match url.host() {
+            Some(url::Host::Ipv4(ip)) => std::net::IpAddr::V4(ip),
+            Some(url::Host::Ipv6(ip)) => std::net::IpAddr::V6(ip),
+            _ => anyhow::bail!("Plain HTTP ingestion requires a literal loopback address"),
+        };
+        return HttpClient::new_loopback_http(
+            std::net::SocketAddr::new(
+                address,
+                url.port_or_known_default()
+                    .context("Ingest URL has no port")?,
+            ),
+            socket_factory,
+        )
+        .await;
+    }
+    anyhow::ensure!(
+        url.scheme() == "https" && url.port_or_known_default() == Some(443),
+        "Remote ingestion requires HTTPS on port 443"
+    );
     let host = url.host_str().context("Ingest URL has no host")?.to_owned();
 
     let addresses = tunnel_bypass_resolver::resolve(&host).await?;
