@@ -417,6 +417,27 @@ impl ClientState {
         }
     }
 
+    /// Configure the device DNS suffix and whether successful answers are cached.
+    /// Defaults to `firezone.network` with caching enabled. Changing either option
+    /// invalidates cached answers and completes pending queries with SERVFAIL.
+    pub fn configure_device_dns(
+        &mut self,
+        domain: DomainName,
+        cache_answers: bool,
+    ) -> anyhow::Result<()> {
+        self.device_stub_resolver.configure(domain, cache_answers)?;
+        self.drain_device_stub_resolver_events();
+        Ok(())
+    }
+
+    /// Invalidate device answers and pending queries after a control-plane change.
+    /// Hosts must also discard their outstanding resolution callbacks so a stale
+    /// result cannot complete a new query for the same name.
+    pub fn clear_device_dns_cache(&mut self) {
+        self.device_stub_resolver.clear_cache();
+        self.drain_device_stub_resolver_events();
+    }
+
     /// Handles the portal's answer to a device name.
     pub fn handle_device_domain_resolved(
         &mut self,
