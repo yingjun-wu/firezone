@@ -1517,9 +1517,16 @@ where
             .handle_timeout(&mut self.agent, self.idle_ice_config, now);
 
         if self.candidate_timeout.is_some_and(|timeout| now >= timeout) {
-            tracing::info!(state = %self.state, index = %self.index.global(), "Connection failed (no candidates received)");
-            self.state = ConnectionState::Failed;
-            return;
+            self.candidate_timeout = None;
+            // A peer-reflexive path can carry authenticated traffic before the
+            // portal delivers any candidates. Do not tear down that working
+            // connection just because signalling is delayed; ICE still owns
+            // subsequent reachability timeouts.
+            if !self.state.has_nominated_socket() || self.first_handshake_completed_at.is_none() {
+                tracing::info!(state = %self.state, index = %self.index.global(), "Connection failed (no candidates received)");
+                self.state = ConnectionState::Failed;
+                return;
+            }
         }
 
         if self
@@ -2385,6 +2392,38 @@ mod tests {
             Event::ConnectionFailed(1),
             Event::ConnectionClosed(1),
         ]
+    }
+
+    #[test]
+    fn candidate_deadline_requires_both_a_nominated_path_and_authenticated_handshake() {
+        for nominated in [false, true] {
+            for authenticated in [false, true] {
+                let now = Instant::now();
+                let mut node = connection_node(now);
+                authorize(&mut node, 1, now).unwrap();
+                let connection = node.connections.get_mut(&1, now).unwrap();
+                if nominated {
+                    connection.state = ConnectionState::Connected {
+                        peer_socket: PeerSocket::PeerToPeer {
+                            source: "192.0.2.1:1000".parse().unwrap(),
+                            dest: "192.0.2.2:2000".parse().unwrap(),
+                        },
+                        last_activity: now,
+                    };
+                }
+                if authenticated {
+                    connection.first_handshake_completed_at = Some(now);
+                }
+                // Exercise the timeout through Node, including failed-connection GC.
+                let _ = node.poll_timeout();
+                node.handle_timeout(now + CANDIDATE_TIMEOUT);
+                assert_eq!(
+                    node.connections.get_mut(&1, now + CANDIDATE_TIMEOUT).is_ok(),
+                    nominated && authenticated,
+                    "nominated={nominated}, authenticated={authenticated}",
+                );
+            }
+        }
     }
 
     #[test]
