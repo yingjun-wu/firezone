@@ -66,6 +66,16 @@ pub use unroutable_packet::UnroutablePacket;
 // their consumers into `connlib-model` so this crate can expose only the
 // state-machine API.
 
+/// Outcome of applying a resource authorization to the native client state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceAuthorizationStatus {
+    /// The authorization was installed on a new or reused connection.
+    /// This does not imply that the peer is reachable yet.
+    Applied,
+    /// No pending request remained; existing connection state was not changed.
+    Ignored,
+}
+
 #[derive(Debug)]
 pub enum ClientEvent {
     AddedIceCandidates {

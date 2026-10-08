@@ -80,6 +80,12 @@ impl PendingAuthorizations {
         self.upsert(request.target(), request, trigger.into(), now);
     }
 
+    pub(super) fn has_resource_authorizations(&self, resource: ResourceId) -> bool {
+        self.inner.keys().any(|target| {
+            matches!(target, AuthorizationTarget::Resources(resources) if resources.contains(&resource))
+        })
+    }
+
     /// Removes every pending request that includes `resource` among its candidates.
     pub fn remove_resource_authorizations(
         &mut self,

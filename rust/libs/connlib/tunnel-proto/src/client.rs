@@ -1047,8 +1047,10 @@ impl ClientState {
             .remove_remote_candidate(conn_id.into(), ice_candidate.into(), now);
     }
 
-    #[tracing::instrument(level = "debug", skip_all, fields(%rid))]
     /// `None` disables flow-log attribution for control planes without an ingest service.
+    ///
+    /// Both applied and ignored authorizations return success for compatibility.
+    /// Use [`Self::handle_resource_access_authorized_with_status`] to distinguish them.
     pub fn handle_resource_access_authorized(
         &mut self,
         rid: ResourceId,
@@ -1063,6 +1065,42 @@ impl ClientState {
         flow_logs_ingest_token: impl Into<Option<IngestToken>>,
         now: Instant,
     ) -> anyhow::Result<Result<(), NoTurnServers>> {
+        self.handle_resource_access_authorized_with_status(
+            rid,
+            gid,
+            gateway_key,
+            gateway_tun,
+            site_id,
+            preshared_key,
+            client_ice,
+            gateway_ice,
+            use_iceless,
+            flow_logs_ingest_token,
+            now,
+        )
+        .map(|result| result.map(|_| ()))
+    }
+
+    /// Applies an authorization only while traffic or DNS queries still need it.
+    ///
+    /// `Applied` means the native authorization was installed, not that ICE or
+    /// the WireGuard handshake has completed. `NoTurnServers` preserves the
+    /// pending request and its traffic so the same authorization can be retried.
+    #[tracing::instrument(level = "debug", skip_all, fields(%rid))]
+    pub fn handle_resource_access_authorized_with_status(
+        &mut self,
+        rid: ResourceId,
+        gid: GatewayId,
+        gateway_key: PublicKey,
+        gateway_tun: IpConfig,
+        site_id: SiteId,
+        preshared_key: SecretKey,
+        client_ice: IceCredentials,
+        gateway_ice: IceCredentials,
+        use_iceless: bool,
+        flow_logs_ingest_token: impl Into<Option<IngestToken>>,
+        now: Instant,
+    ) -> anyhow::Result<Result<crate::ResourceAuthorizationStatus, NoTurnServers>> {
         tracing::debug!(%gid, "New resource access authorized");
 
         let resource = self.resources_by_id.get(&rid).context("Unknown resource")?;
@@ -1071,13 +1109,10 @@ impl ClientState {
             "Device pool cannot be authorized through a gateway"
         );
 
-        let pending_authorizations = self
-            .pending_authorizations
-            .remove_resource_authorizations(rid);
-        if pending_authorizations.is_empty() {
+        if !self.pending_authorizations.has_resource_authorizations(rid) {
             tracing::debug!("No pending authorization");
 
-            return Ok(Ok(()));
+            return Ok(Ok(crate::ResourceAuthorizationStatus::Ignored));
         }
 
         match self.node.upsert_connection_with_status(
@@ -1104,6 +1139,9 @@ impl ClientState {
             Ok(snownet::ConnectionUpsert::Reused) => {}
             Err(e) => return Ok(Err(e)),
         };
+        let pending_authorizations = self
+            .pending_authorizations
+            .remove_resource_authorizations(rid);
         self.outbound_authorizations
             .authorize_gateway(rid, gid, flow_logs_ingest_token);
         self.gateways_by_site
@@ -1175,7 +1213,7 @@ impl ClientState {
             );
         }
 
-        Ok(Ok(()))
+        Ok(Ok(crate::ResourceAuthorizationStatus::Applied))
     }
 
     pub fn handle_client_device_access_authorized(
@@ -3062,6 +3100,118 @@ fn test_ingest_token() -> IngestToken {
 mod tests {
     use super::*;
     use crate::messages::PortRange;
+
+    fn authorize_resource_without_new_request(
+        state: &mut ClientState,
+        now: Instant,
+    ) -> Result<crate::ResourceAuthorizationStatus, NoTurnServers> {
+        state
+            .handle_resource_access_authorized_with_status(
+                ResourceId::from_u128(1),
+                GatewayId::from_u128(1),
+                PublicKey::from(&x25519::StaticSecret::from([9; 32])),
+                IpConfig {
+                    v4: device_tun_ipv4(),
+                    v6: "fd00:2021:1111::2".parse().unwrap(),
+                },
+                SiteId::from_u128(1),
+                Box::new(crate::messages::Key([2; 32])).into(),
+                IceCredentials {
+                    username: "local-2".into(),
+                    password: "password".into(),
+                },
+                IceCredentials {
+                    username: "remote-2".into(),
+                    password: "password".into(),
+                },
+                false,
+                None,
+                now,
+            )
+            .unwrap()
+    }
+
+    #[test_case::test_case(false; "no_connection")]
+    #[test_case::test_case(true; "existing_connection")]
+    fn authorization_without_pending_request_does_not_install_connection(existing: bool) {
+        let now = Instant::now();
+        let mut state = ClientState::for_test();
+        state.update_interface_config(interface(own_tun_ipv4(), own_tun_ipv6()));
+        let resource = ResourceId::from_u128(1);
+        state.upsert_resource(
+            Resource::Cidr(resource::CidrResource {
+                id: resource,
+                address: "172.20.0.0/16".parse().unwrap(),
+                name: "private".into(),
+                address_description: None,
+                sites: vec![],
+                filters: vec![],
+            }),
+            now,
+        );
+        crate::test_utils::discover_relay(&mut state.node, now);
+        let now = now + Duration::from_millis(2);
+        if existing {
+            authorize_candidate_peer(&mut state, false, 1, now).unwrap();
+        }
+        state.drain_node_events(now);
+        while state.poll_event().is_some() {}
+        assert_eq!(
+            authorize_resource_without_new_request(&mut state, now).unwrap(),
+            crate::ResourceAuthorizationStatus::Ignored,
+        );
+        assert_eq!(
+            state.gateway_by_resource(&resource),
+            existing.then(|| GatewayId::from_u128(1)),
+        );
+        state.drain_node_events(now);
+        assert!(
+            state.poll_event().is_none(),
+            "ignored authorization must not emit connection events",
+        );
+    }
+
+    #[test_case::test_case(false; "retry")]
+    #[test_case::test_case(true; "revoked_before_retry")]
+    fn authorization_retries_after_no_relays_without_new_traffic(revoked: bool) {
+        let now = Instant::now();
+        let mut state = ClientState::for_test();
+        state.update_interface_config(interface(own_tun_ipv4(), own_tun_ipv6()));
+        let resource = ResourceId::from_u128(1);
+        state.upsert_resource(
+            Resource::Cidr(resource::CidrResource {
+                id: resource,
+                address: "172.20.0.0/16".parse().unwrap(),
+                name: "private".into(),
+                address_description: None,
+                sites: vec![],
+                filters: vec![],
+            }),
+            now,
+        );
+        assert!(authorize_candidate_peer(&mut state, false, 2, now).is_err());
+        assert_eq!(state.gateway_by_resource(&resource), None);
+        assert!(state.pending_authorizations.has_resource_authorizations(resource));
+        if revoked {
+            let definition = state.resources_by_id[&resource].clone();
+            state.remove_resource(resource, now);
+            state.upsert_resource(definition, now);
+        }
+        crate::test_utils::discover_relay(&mut state.node, now);
+        assert_eq!(
+            authorize_resource_without_new_request(&mut state, now + Duration::from_millis(2)).unwrap(),
+            if revoked {
+                crate::ResourceAuthorizationStatus::Ignored
+            } else {
+                crate::ResourceAuthorizationStatus::Applied
+            },
+        );
+        assert_eq!(
+            state.gateway_by_resource(&resource),
+            (!revoked).then(|| GatewayId::from_u128(1)),
+        );
+        assert!(!state.pending_authorizations.has_resource_authorizations(resource));
+    }
 
     fn authorize_candidate_peer(
         state: &mut ClientState,
