@@ -266,6 +266,13 @@ impl GatewayState {
         self.node.close_connection(*id, p2p_control::goodbye(), now);
     }
 
+    /// Whether the native transport exists, including during negotiation.
+    /// Resource authorizations can outlive that transport and are not sufficient
+    /// to confirm that a candidate update was applied to a live connection.
+    pub fn has_connection(&self, client: &ClientId) -> bool {
+        self.node.has_connection(client)
+    }
+
     pub fn add_ice_candidate(
         &mut self,
         conn_id: ClientId,
@@ -773,6 +780,42 @@ mod tests {
             now,
             None,
         )
+    }
+
+    #[test]
+    fn transport_presence_does_not_follow_retained_resource_authorization() {
+        let now = Instant::now();
+        let mut state = GatewayState::new([8; 32], now, Duration::ZERO);
+        state.update_tun_device(IpConfig {
+            v4: "100.64.0.1".parse().unwrap(),
+            v6: "fd00:2021:1111::2".parse().unwrap(),
+        });
+        let client = ClientId::from_u128(1);
+        assert!(authorize(&mut state, 1, now).is_err());
+        assert!(!state.has_connection(&client));
+        crate::test_utils::discover_relay(&mut state.node, now);
+        let now = now + Duration::from_millis(2);
+        authorize(&mut state, 1, now).unwrap();
+        assert!(state.has_connection(&client), "negotiating connections accept candidates");
+        assert!(!state.node.is_connected(&client));
+        assert!(!state.has_connection(&ClientId::from_u128(2)));
+
+        let _ = state.poll_timeout();
+        let expired = now + Duration::from_secs(11);
+        state.handle_timeout(expired);
+        assert!(!state.has_connection(&client));
+        // Resource state intentionally survives native setup failure.
+        state.update_access_authorization_expiry(
+            client, ResourceId::from_u128(1), Duration::from_secs(60), expired,
+        ).unwrap();
+        assert!(!state.has_connection(&client));
+
+        authorize(&mut state, 2, expired).unwrap();
+        assert!(state.has_connection(&client));
+        state.remove_access(&client, &ResourceId::from_u128(1), expired);
+        assert!(state.has_connection(&client));
+        state.remove_access(&client, &ResourceId::from_u128(2), expired);
+        assert!(!state.has_connection(&client));
     }
 
     #[test_case::test_case(false, false; "replacement")]

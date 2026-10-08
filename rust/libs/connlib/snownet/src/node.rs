@@ -282,6 +282,12 @@ where
         self.connections.len()
     }
 
+    /// Whether a non-failed connection is installed, including one still negotiating.
+    /// This does not assert authorization or data-plane connectivity.
+    pub fn has_connection(&self, cid: &TId) -> bool {
+        self.connections.has_connection(cid)
+    }
+
     /// Whether the connection to `cid` has completed setup and is available for traffic.
     pub fn is_connected(&self, cid: &TId) -> bool {
         self.connections.is_connected(cid)
