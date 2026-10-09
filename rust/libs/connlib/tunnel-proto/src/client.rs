@@ -2172,35 +2172,57 @@ impl ClientState {
                 });
             }
             resource_stub_resolver::ResolveStrategy::RecurseSite(resources) => {
-                let gateway_id = resources.iter().find_map(|resource| {
-                    self.outbound_authorizations
-                        .gateway_by_resource(*resource)
-                        .copied()
-                });
-                let Some(gateway) = gateway_id.and_then(|id| self.gateways.peer_by_id_mut(&id))
-                else {
-                    self.pending_authorizations.on_not_authorized(
-                        AuthorizationRequest::Resources(resources),
-                        DnsQueryForSite {
-                            local,
-                            remote,
-                            transport,
-                            message,
-                        },
-                        now,
-                    );
-                    return None;
-                };
-
-                let server = gateway.tun_dns_server_endpoint(local.ip());
-
-                self.forward_dns_query_to_new_upstream_via_tunnel(
-                    local, remote, server, message, transport, now,
-                );
+                self.handle_dns_query_for_site(resources, DnsQueryForSite {
+                    local, remote, transport, message,
+                }, now);
             }
         };
 
         None
+    }
+
+    fn handle_dns_query_for_site(&mut self, resources: Vec<ResourceId>, query: DnsQueryForSite, now: Instant) {
+        let gateway_id = resources.iter().find_map(|resource| {
+            self.outbound_authorizations.gateway_by_resource(*resource).copied()
+        });
+        let Some(gateway) = gateway_id.and_then(|id| self.gateways.peer_by_id_mut(&id)) else {
+            self.pending_authorizations.on_not_authorized(
+                AuthorizationRequest::Resources(resources), query, now,
+            );
+            return;
+        };
+        let server = gateway.tun_dns_server_endpoint(query.local.ip());
+        self.forward_dns_query_to_new_upstream_via_tunnel(
+            query.local, query.remote, server, query.message, query.transport, now,
+        );
+    }
+
+    fn refresh_pending_dns_authorizations(&mut self, now: Instant) {
+        let dns_resources = self.resources_by_id.iter().filter_map(|(id, resource)| {
+            matches!(resource, Resource::Dns(_)).then_some(*id)
+        }).collect();
+        let pending = self.pending_authorizations.take_resource_authorizations(&dns_resources);
+        for pending in pending {
+            let (packets, queries) = pending.into_buffers();
+            for packet in packets {
+                if let Err(error) = self.handle_out_of_band_ip_packet(packet, now) {
+                    tracing::debug!("Failed to re-route buffered DNS resource packet: {error:#}");
+                }
+            }
+            for query in queries {
+                match self.resource_stub_resolver.handle_query(&query.message) {
+                    resource_stub_resolver::ResolveStrategy::RecurseSite(resources) => {
+                        self.handle_dns_query_for_site(resources, query, now);
+                    }
+                    _ => {
+                        // A former site query must not leak to the local resolver
+                        // when its resource disappears or stops matching.
+                        self.send_dns_response(query.local, query.remote, query.transport,
+                            dns_types::Response::servfail(&query.message));
+                    }
+                }
+            }
+        }
     }
 
     fn forward_dns_query_to_new_upstream_via_tunnel(
@@ -2661,6 +2683,9 @@ impl ClientState {
                 );
 
                 self.update_dns_resource_routes(result.routes);
+                if result.is_new {
+                    self.refresh_pending_dns_authorizations(now);
+                }
 
                 result.is_new
             }
@@ -3213,6 +3238,64 @@ mod tests {
             (!revoked).then(|| GatewayId::from_u128(1)),
         );
         assert!(!state.pending_authorizations.has_resource_authorizations(resource));
+    }
+
+    #[test]
+    fn new_dns_candidate_refreshes_buffered_traffic_without_a_new_query_or_packet() {
+        let now = Instant::now();
+        let mut state = ClientState::for_test();
+        state.update_interface_config(interface(own_tun_ipv4(), own_tun_ipv6()));
+        let resource = |id, address: &str| Resource::Dns(resource::DnsResource {
+            id: ResourceId::from_u128(id), address: address.into(), name: address.into(),
+            address_description: None, sites: vec![], ip_stack: connlib_model::IpStack::Dual,
+            filters: vec![],
+        });
+        state.upsert_resource(resource(1, "db.example.com"), now);
+        let query = dns_types::Query::new("db.example.com".parse().unwrap(), dns_types::RecordType::A);
+        let resource_stub_resolver::ResolveStrategy::LocalResponse { routes, .. } =
+            state.resource_stub_resolver.handle_query(&query) else { panic!("DNS must be local") };
+        let proxy = routes[0].proxy_ips[0];
+        state.update_dns_resource_routes(routes);
+        state.handle_out_of_band_ip_packet(ip_packet::make::udp_packet(
+            own_tun_ipv4(), proxy, 1234, 8000, &[1]).unwrap(), now).unwrap();
+        assert_eq!(state.pending_authorizations.poll_authorization_requests(),
+            Some(AuthorizationRequest::resources([ResourceId::from_u128(1)])));
+        state.upsert_resource(resource(2, "*.example.com"), now);
+        assert_eq!(state.pending_authorizations.poll_authorization_requests(),
+            Some(AuthorizationRequest::resources([ResourceId::from_u128(1), ResourceId::from_u128(2)])));
+        assert!(state.pending_authorizations.poll_authorization_requests().is_none());
+        assert_eq!(state.gateway_by_resource(&ResourceId::from_u128(2)), None,
+            "candidate refresh is not authorization");
+        assert_eq!(state.resource_stub_resolver.resolved_resources().next().unwrap().2[0], proxy);
+    }
+
+    #[test]
+    fn new_dns_candidate_refreshes_pending_site_queries_and_clears_obsolete_requests() {
+        for kind in [dns_types::RecordType::SRV, dns_types::RecordType::TXT] {
+            let now = Instant::now();
+            let mut state = ClientState::for_test();
+            let resource = |id, address: &str| Resource::Dns(resource::DnsResource {
+                id: ResourceId::from_u128(id), address: address.into(), name: address.into(),
+                address_description: None, sites: vec![], ip_stack: connlib_model::IpStack::Dual,
+                filters: vec![],
+            });
+            state.upsert_resource(resource(1, "db.example.com"), now);
+            state.handle_dns_query_for_site(vec![ResourceId::from_u128(1)], DnsQueryForSite {
+                local: "100.100.111.1:53".parse().unwrap(),
+                remote: "100.64.0.1:1234".parse().unwrap(),
+                transport: dns::Transport::Udp,
+                message: dns_types::Query::new("db.example.com".parse().unwrap(), kind),
+            }, now);
+            // Leave the old request queued: refresh must replace, not append to it.
+            state.upsert_resource(resource(2, "*.example.com"), now);
+            assert_eq!(state.pending_authorizations.poll_authorization_requests(),
+                Some(AuthorizationRequest::resources([ResourceId::from_u128(1), ResourceId::from_u128(2)])));
+            assert!(state.pending_authorizations.poll_authorization_requests().is_none());
+            let pending = state.pending_authorizations.remove_resource_authorizations(ResourceId::from_u128(2));
+            assert_eq!(pending.len(), 1);
+            let (_, queries) = pending.into_iter().next().unwrap().into_buffers();
+            assert_eq!(queries.into_iter().count(), 1);
+        }
     }
 
     fn authorize_candidate_peer(
