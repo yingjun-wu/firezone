@@ -20,10 +20,11 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Keeps downstream resolver caches short-lived so mapping changes propagate quickly.
 const DNS_TTL: u32 = 1;
 
-/// Answers device queries through the portal, which decides lookup authorization.
-/// The original `<slug>.firezone.network` suffix remains the default.
+/// Answers device names through the portal. Defaults to `<slug>.firezone.network`.
+/// The host can disable answer caching when every lookup requires authorization.
 pub struct DeviceStubResolver {
     device_domain: DomainName,
+    cache_answers: bool,
     resolved: BTreeMap<DomainName, (Ipv4Addr, Ipv6Addr)>,
     pending: ExpiringMap<DomainName, SmallVec<[PendingQuery; 2]>>,
 
@@ -64,6 +65,7 @@ impl Default for DeviceStubResolver {
     fn default() -> Self {
         Self {
             device_domain: dns::DEVICE_DOMAIN.parse().expect("valid device domain"),
+            cache_answers: true,
             resolved: Default::default(),
             pending: Default::default(),
             events: Default::default(),
@@ -73,19 +75,26 @@ impl Default for DeviceStubResolver {
 
 impl DeviceStubResolver {
     pub(crate) fn set_device_domain(&mut self, domain: DomainName) -> anyhow::Result<()> {
+        self.configure(domain, true)
+    }
+
+    pub(crate) fn configure(
+        &mut self,
+        domain: DomainName,
+        cache_answers: bool,
+    ) -> anyhow::Result<()> {
         anyhow::ensure!(
             !domain.to_string().trim_end_matches('.').is_empty(),
             "device domain must not be root"
         );
-        if self.device_domain != domain {
+        if self.device_domain != domain || self.cache_answers != cache_answers {
             self.clear_cache();
             self.device_domain = domain;
+            self.cache_answers = cache_answers;
         }
         Ok(())
     }
 
-    /// A policy change must invalidate both cached and outstanding answers.
-    /// Complete waiters before allowing a fresh, re-authorized lookup.
     pub(crate) fn clear_cache(&mut self) {
         self.resolved.clear();
         self.events.clear();
@@ -171,7 +180,9 @@ impl DeviceStubResolver {
 
         tracing::debug!(%domain, ?result, "Device name resolved");
 
-        if let Ok((ipv4, ipv6)) = result {
+        if let Ok((ipv4, ipv6)) = result
+            && self.cache_answers
+        {
             self.resolved.insert(domain, (ipv4, ipv6));
         }
 
@@ -202,10 +213,6 @@ impl DeviceStubResolver {
         }
     }
 
-    /// Forgets the resolution of a device, so its next lookup asks the portal again.
-    ///
-    /// A resolution stands for the grant that came with it; when the grant goes, so
-    /// does the answer.
     pub(crate) fn poll_event(&mut self) -> Option<Event> {
         self.events.pop_front()
     }
@@ -272,35 +279,78 @@ mod tests {
     const TEST_IPV6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x2021, 0x1111, 0, 0, 0, 0, 42);
 
     #[test]
-    fn configured_domain_and_policy_invalidation() {
+    fn configured_domain_matches_only_one_label_and_preserves_default() {
         let mut resolver = DeviceStubResolver::default();
+        assert!(resolver.configure(domain("."), false).is_err());
+        assert!(matches!(
+            handle(&mut resolver, DEVICE, dns_types::RecordType::A),
+            ResolveStrategy::Pending
+        ));
         resolver
-            .set_device_domain(domain("devices.edgewall.internal"))
+            .configure(domain("devices.example.test."), false)
+            .unwrap();
+        assert!(
+            matches!(drain(&mut resolver).as_slice(), [Event::SendResponse { response, .. }] if response.response_code() == dns_types::ResponseCode::SERVFAIL)
+        );
+        for name in [
+            DEVICE,
+            "devices.example.test",
+            "a.b.devices.example.test",
+            "a.devices.example.test.invalid",
+        ] {
+            assert!(matches!(
+                handle(&mut resolver, name, dns_types::RecordType::A),
+                ResolveStrategy::Passthrough
+            ));
+        }
+        assert!(matches!(
+            handle(
+                &mut resolver,
+                "LAPTOP.Devices.Example.Test.",
+                dns_types::RecordType::AAAA
+            ),
+            ResolveStrategy::Pending
+        ));
+    }
+
+    #[test]
+    fn disabling_cache_rechecks_answers_and_clear_cancels_pending_queries() {
+        let mut resolver = DeviceStubResolver::default();
+        handle(&mut resolver, DEVICE, dns_types::RecordType::A);
+        drain(&mut resolver);
+        resolver.handle_device_domain_resolved(domain(DEVICE), Ok((TEST_IPV4, TEST_IPV6)));
+        drain(&mut resolver);
+        resolver
+            .configure(domain(dns::DEVICE_DOMAIN), false)
             .unwrap();
         assert!(matches!(
             handle(&mut resolver, DEVICE, dns_types::RecordType::A),
-            ResolveStrategy::Passthrough
-        ));
-        let name = "laptop.devices.edgewall.internal";
-        assert!(matches!(
-            handle(&mut resolver, name, dns_types::RecordType::A),
             ResolveStrategy::Pending
         ));
         drain(&mut resolver);
-        resolver.handle_device_domain_resolved(domain(name), Ok((TEST_IPV4, TEST_IPV6)));
-        drain(&mut resolver);
-        resolver.clear_cache();
-        assert!(matches!(
-            handle(&mut resolver, name, dns_types::RecordType::A),
-            ResolveStrategy::Pending
-        ));
-        resolver.clear_cache();
-        let events = drain(&mut resolver);
+        resolver.handle_device_domain_resolved(domain(DEVICE), Ok((TEST_IPV4, TEST_IPV6)));
         assert!(
-            matches!(events.as_slice(), [Event::SendResponse { response, .. }] if response.response_code() == dns_types::ResponseCode::SERVFAIL)
+            matches!(drain(&mut resolver).as_slice(), [Event::SendResponse { response, .. }] if response.records().count() == 1)
         );
-        resolver.handle_device_domain_resolved(domain(name), Ok((TEST_IPV4, TEST_IPV6)));
+        assert!(matches!(
+            handle(&mut resolver, DEVICE, dns_types::RecordType::AAAA),
+            ResolveStrategy::Pending
+        ));
+        resolver.clear_cache();
+        assert!(
+            matches!(drain(&mut resolver).as_slice(), [Event::SendResponse { response, .. }] if response.response_code() == dns_types::ResponseCode::SERVFAIL)
+        );
+        resolver.handle_device_domain_resolved(domain(DEVICE), Ok((TEST_IPV4, TEST_IPV6)));
         assert!(resolver.poll_event().is_none());
+        assert!(matches!(
+            handle(&mut resolver, DEVICE, dns_types::RecordType::A),
+            ResolveStrategy::Pending
+        ));
+        drain(&mut resolver);
+        resolver.handle_device_domain_resolved(domain(DEVICE), Err(FailReason::NotFound));
+        assert!(
+            matches!(drain(&mut resolver).as_slice(), [Event::SendResponse { response, .. }] if response.response_code() == dns_types::ResponseCode::NXDOMAIN)
+        );
     }
 
     #[test]

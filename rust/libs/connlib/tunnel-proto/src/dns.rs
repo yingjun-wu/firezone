@@ -17,16 +17,15 @@ pub fn device_slug(domain: &dns_types::DomainName) -> Option<String> {
     device_slug_in(domain, &DEVICE_DOMAIN.parse().expect("valid device domain"))
 }
 
-/// The slug under a host-configured device domain. Only one additional label matches.
-pub fn device_slug_in(
+pub(crate) fn device_slug_in(
     domain: &dns_types::DomainName,
-    device_domain: &dns_types::DomainName,
+    suffix: &dns_types::DomainName,
 ) -> Option<String> {
     let name = domain
         .to_string()
         .trim_end_matches('.')
         .to_ascii_lowercase();
-    let suffix = device_domain
+    let suffix = suffix
         .to_string()
         .trim_end_matches('.')
         .to_ascii_lowercase();
