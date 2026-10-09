@@ -2351,10 +2351,12 @@ impl ClientState {
                         .insert(candidate.into());
                 }
                 snownet::Event::ConnectionEstablished(ClientOrGatewayId::Gateway(id)) => {
+                    tracing::info!(gateway_id = %id, "Native connection established: WireGuard handshake and nominated socket ready");
                     self.flush_pending_packets(ClientOrGatewayId::Gateway(id), now);
                     self.update_site_status_by_gateway(&id, ResourceStatus::Online, now);
                 }
                 snownet::Event::ConnectionEstablished(ClientOrGatewayId::Client(id)) => {
+                    tracing::info!(client_id = %id, "Native connection established: WireGuard handshake and nominated socket ready");
                     self.flush_pending_packets(ClientOrGatewayId::Client(id), now);
                     self.resource_list.update(self.resource_list_snapshot());
                 }

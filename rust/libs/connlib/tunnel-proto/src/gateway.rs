@@ -556,7 +556,9 @@ impl GatewayState {
                         .or_default()
                         .insert(candidate.into());
                 }
-                snownet::Event::ConnectionEstablished(_) => {}
+                snownet::Event::ConnectionEstablished(id) => {
+                    tracing::info!(client_id = %id, "Native connection established: WireGuard handshake and nominated socket ready");
+                }
                 snownet::Event::NoRelays => {
                     self.buffered_events.push_back(GatewayEvent::NoRelays);
                 }
