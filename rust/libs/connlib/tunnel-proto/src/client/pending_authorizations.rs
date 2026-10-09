@@ -107,13 +107,15 @@ impl PendingAuthorizations {
         &mut self,
         affected: &BTreeSet<ResourceId>,
     ) -> Vec<PendingAuthorization> {
-        self.authorization_requests.retain(|request| {
-            !matches!(request, AuthorizationRequest::Resources(resources)
-                if resources.iter().any(|id| affected.contains(id)))
-        });
-        self.remove_matching(|target| matches!(target, AuthorizationTarget::Resources(resources)
-            if resources.iter().any(|id| affected.contains(id))))
-            .collect()
+        let removed = self.inner.extract_if(.., |target, pending| {
+            // NoAuthorization carries no destination to re-route. Preserve its
+            // request and retry state until traffic supplies that information.
+            (pending.packets.len() > 0 || !pending.dns_queries.is_empty())
+                && matches!(target, AuthorizationTarget::Resources(resources)
+                    if resources.iter().any(|id| affected.contains(id)))
+        }).collect::<BTreeMap<_, _>>();
+        self.authorization_requests.retain(|request| !removed.contains_key(&request.target()));
+        removed.into_values().collect()
     }
 
     /// Removes pending device requests that named `pool` among their candidates.
@@ -345,6 +347,19 @@ mod tests {
         assert_eq!(pending.poll_authorization_requests(), Some(device_request(device_ip())));
         assert!(pending.poll_authorization_requests().is_none());
         assert_eq!(pending.remove_resource_authorizations(cidr).len(), 1);
+    }
+
+    #[test]
+    fn refresh_keeps_reauthorization_without_buffered_traffic() {
+        let now = Instant::now();
+        let mut pending = PendingAuthorizations::default();
+        let dns = ResourceId::from_u128(1);
+        pending.on_not_authorized(resource_request(dns), Trigger::NoAuthorization, now);
+        assert!(pending.take_resource_authorizations(&BTreeSet::from([dns])).is_empty());
+        assert_eq!(pending.poll_authorization_requests(), Some(resource_request(dns)));
+        assert!(pending.has_resource_authorizations(dns));
+        pending.on_not_authorized(resource_request(dns), Trigger::NoAuthorization, now + Duration::from_secs(2));
+        assert_eq!(pending.poll_authorization_requests(), Some(resource_request(dns)));
     }
 
     #[test]
