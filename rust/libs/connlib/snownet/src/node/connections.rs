@@ -293,6 +293,10 @@ where
         self.established.len()
     }
 
+    pub(crate) fn has_connection(&self, id: &TId) -> bool {
+        self.established.get(id).is_some_and(|connection| !connection.is_failed())
+    }
+
     pub(crate) fn is_connected(&self, id: &TId) -> bool {
         self.established
             .get(id)

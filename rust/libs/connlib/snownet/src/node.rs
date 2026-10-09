@@ -131,6 +131,16 @@ pub struct NoTurnServers {}
 #[error("Connection is still establishing")]
 pub struct StillConnecting;
 
+/// Whether an upsert installed a new transport or reused the current one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionUpsert {
+    /// A new connection was installed, possibly replacing an existing connection.
+    /// Unconsumed events and in-flight STUN request associations for the old connection were discarded.
+    Created,
+    /// The existing connection was reused; its events remain valid.
+    Reused,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct IceConfig {
     pub(crate) max_retrans: usize,
@@ -272,6 +282,12 @@ where
         self.connections.len()
     }
 
+    /// Whether a non-failed connection is installed, including one still negotiating.
+    /// This does not assert authorization or data-plane connectivity.
+    pub fn has_connection(&self, cid: &TId) -> bool {
+        self.connections.has_connection(cid)
+    }
+
     /// Whether the connection to `cid` has completed setup and is available for traffic.
     pub fn is_connected(&self, cid: &TId) -> bool {
         self.connections.is_connected(cid)
@@ -279,9 +295,8 @@ where
 
     /// Upserts a connection to the given remote.
     ///
-    /// If we already have a connection with the same parameters, this does nothing.
-    /// Otherwise, the existing connection is discarded and a new one will be created.
-    #[tracing::instrument(level = "info", skip_all, fields(%cid))]
+    /// Matching parameters reuse the connection and re-signal its current candidates.
+    /// Otherwise, the existing connection is discarded and a new one is created.
     pub fn upsert_connection(
         &mut self,
         cid: TId,
@@ -295,6 +310,40 @@ where
         use_iceless: bool,
         now: Instant,
     ) -> Result<(), NoTurnServers> {
+        self.upsert_connection_with_status(
+            cid,
+            remote,
+            preshared_key,
+            local_creds,
+            remote_creds,
+            ice_role,
+            default_ice_config,
+            idle_ice_config,
+            use_iceless,
+            now,
+        )
+        .map(|_| ())
+    }
+
+    /// Upserts a connection and reports whether it was newly installed or reused.
+    ///
+    /// Callers that buffer connection events must discard their old events for `cid`
+    /// on [`ConnectionUpsert::Created`] before exposing events under the new connection.
+    /// An error leaves the existing connection and its events intact.
+    #[tracing::instrument(level = "info", skip_all, fields(%cid))]
+    pub fn upsert_connection_with_status(
+        &mut self,
+        cid: TId,
+        remote: PublicKey,
+        preshared_key: x25519::StaticSecret,
+        local_creds: Credentials,
+        remote_creds: Credentials,
+        ice_role: IceRole,
+        default_ice_config: IceConfig,
+        idle_ice_config: IceConfig,
+        use_iceless: bool,
+        now: Instant,
+    ) -> Result<ConnectionUpsert, NoTurnServers> {
         self.last_now = now;
 
         let local_creds = local_creds.into();
@@ -344,10 +393,22 @@ where
                 c.initiate_wg_session(&mut self.allocations, &mut self.buffered_transmits, now);
             }
 
-            return Ok(());
+            return Ok(ConnectionUpsert::Reused);
         }
 
         let selected_relay = self.sample_relay()?;
+
+        // The new connection can now be installed. Old events must not be interpreted
+        // as events for a different transport that happens to use the same ID.
+        self.pending_events.retain(|event| match event {
+            Event::NewIceCandidate { connection, .. }
+            | Event::InvalidateIceCandidate { connection, .. } => *connection != cid,
+            Event::ConnectionEstablished(id)
+            | Event::ConnectionFailed(id)
+            | Event::ConnectionClosed(id) => *id != cid,
+            Event::NoRelays => true,
+        });
+        self.inflight_stun_requests.remove_by_conn_id(cid);
 
         let existing = self.connections.remove_established(&cid, now);
         let index = self.index.next();
@@ -408,7 +469,7 @@ where
             self.add_remote_candidate(cid, candidate, now);
         }
 
-        Ok(())
+        Ok(ConnectionUpsert::Created)
     }
 
     /// Removes a connection by just clearing its local memory.
@@ -1462,9 +1523,16 @@ where
             .handle_timeout(&mut self.agent, self.idle_ice_config, now);
 
         if self.candidate_timeout.is_some_and(|timeout| now >= timeout) {
-            tracing::info!(state = %self.state, index = %self.index.global(), "Connection failed (no candidates received)");
-            self.state = ConnectionState::Failed;
-            return;
+            self.candidate_timeout = None;
+            // A peer-reflexive path can carry authenticated traffic before the
+            // portal delivers any candidates. Do not tear down that working
+            // connection just because signalling is delayed; ICE still owns
+            // subsequent reachability timeouts.
+            if !self.state.has_nominated_socket() || self.first_handshake_completed_at.is_none() {
+                tracing::info!(state = %self.state, index = %self.index.global(), "Connection failed (no candidates received)");
+                self.state = ConnectionState::Failed;
+                return;
+            }
         }
 
         if self
@@ -2270,6 +2338,173 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 
     use super::*;
+
+    fn connection_node(now: Instant) -> Node<u32, u32> {
+        let mut node = Node::new([7; 32], now, Duration::ZERO);
+        node.update_relays(
+            BTreeSet::new(),
+            &BTreeSet::from([(
+                1,
+                RelaySocket::V4("127.0.0.1:3478".parse().unwrap()),
+                "test".into(),
+                "password".into(),
+                "firezone".into(),
+            )]),
+            now,
+        );
+        node.allocations
+            .get_mut_by_id(&1)
+            .unwrap()
+            .set_rtt(Duration::from_millis(1));
+        node
+    }
+
+    fn authorize(
+        node: &mut Node<u32, u32>,
+        version: u8,
+        now: Instant,
+    ) -> Result<(), NoTurnServers> {
+        node.upsert_connection(
+            1,
+            PublicKey::from(&StaticSecret::from([9; 32])),
+            StaticSecret::from([version; 32]),
+            Credentials {
+                username: "local".into(),
+                password: "password".into(),
+            },
+            Credentials {
+                username: "remote".into(),
+                password: "password".into(),
+            },
+            IceRole::Controlling,
+            IceConfig::client_default(),
+            IceConfig::client_idle(),
+            false,
+            now,
+        )
+    }
+
+    fn old_connection_events() -> Vec<Event<u32>> {
+        vec![
+            Event::NewIceCandidate {
+                connection: 1,
+                candidate: "old-added".into(),
+            },
+            Event::InvalidateIceCandidate {
+                connection: 1,
+                candidate: "old-removed".into(),
+            },
+            Event::ConnectionEstablished(1),
+            Event::ConnectionFailed(1),
+            Event::ConnectionClosed(1),
+        ]
+    }
+
+    #[test]
+    fn candidate_deadline_requires_both_a_nominated_path_and_authenticated_handshake() {
+        for nominated in [false, true] {
+            for authenticated in [false, true] {
+                let now = Instant::now();
+                let mut node = connection_node(now);
+                authorize(&mut node, 1, now).unwrap();
+                let connection = node.connections.get_mut(&1, now).unwrap();
+                if nominated {
+                    connection.state = ConnectionState::Connected {
+                        peer_socket: PeerSocket::PeerToPeer {
+                            source: "192.0.2.1:1000".parse().unwrap(),
+                            dest: "192.0.2.2:2000".parse().unwrap(),
+                        },
+                        last_activity: now,
+                    };
+                }
+                if authenticated {
+                    connection.first_handshake_completed_at = Some(now);
+                }
+                // Exercise the timeout through Node, including failed-connection GC.
+                let _ = node.poll_timeout();
+                node.handle_timeout(now + CANDIDATE_TIMEOUT);
+                assert_eq!(
+                    node.connections.get_mut(&1, now + CANDIDATE_TIMEOUT).is_ok(),
+                    nominated && authenticated,
+                    "nominated={nominated}, authenticated={authenticated}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn replacing_connection_discards_queued_events_for_only_that_connection() {
+        let now = Instant::now();
+        let mut node = connection_node(now);
+        authorize(&mut node, 1, now).unwrap();
+        node.pending_events.extend(old_connection_events());
+        let old_request = is::stun::TransId::new();
+        let other_request = is::stun::TransId::new();
+        node.inflight_stun_requests.add(1, old_request, now);
+        node.inflight_stun_requests.add(2, other_request, now);
+        let other = Event::NewIceCandidate {
+            connection: 2,
+            candidate: "other".into(),
+        };
+        node.pending_events.push_back(other.clone());
+        node.pending_events.push_back(Event::NoRelays);
+
+        authorize(&mut node, 2, now).unwrap();
+
+        let events = std::iter::from_fn(|| node.poll_event()).collect::<Vec<_>>();
+        assert_eq!(events, vec![other, Event::NoRelays]);
+        assert_eq!(node.inflight_stun_requests.remove(old_request), None);
+        assert_eq!(node.inflight_stun_requests.remove(other_request), Some(2));
+    }
+
+    #[test]
+    fn recreating_removed_connection_discards_its_unconsumed_events() {
+        let now = Instant::now();
+        let mut node = connection_node(now);
+        authorize(&mut node, 1, now).unwrap();
+        node.pending_events.extend(old_connection_events());
+        node.remove_connection(1, "test disconnect", now);
+
+        authorize(&mut node, 2, now).unwrap();
+
+        assert_eq!(node.poll_event(), None);
+    }
+
+    #[test]
+    fn reusing_connection_preserves_queued_events() {
+        let now = Instant::now();
+        let mut node = connection_node(now);
+        authorize(&mut node, 1, now).unwrap();
+        let event = old_connection_events().remove(0);
+        node.pending_events.push_back(event.clone());
+        let request = is::stun::TransId::new();
+        node.inflight_stun_requests.add(1, request, now);
+
+        authorize(&mut node, 1, now).unwrap();
+
+        assert_eq!(node.poll_event(), Some(event));
+        assert_eq!(node.inflight_stun_requests.remove(request), Some(1));
+    }
+
+    #[test]
+    fn failed_replacement_preserves_queued_events_and_existing_connection() {
+        let now = Instant::now();
+        let mut node = connection_node(now);
+        authorize(&mut node, 1, now).unwrap();
+        node.allocations.remove_by_id(&1);
+        node.pending_events.extend(old_connection_events());
+        let request = is::stun::TransId::new();
+        node.inflight_stun_requests.add(1, request, now);
+
+        assert!(authorize(&mut node, 2, now).is_err());
+        assert_eq!(node.inflight_stun_requests.remove(request), Some(1));
+        assert_eq!(
+            std::iter::from_fn(|| node.poll_event()).collect::<Vec<_>>(),
+            old_connection_events()
+        );
+        // Reuse still succeeds without sampling a relay; the failed replacement did not remove it.
+        authorize(&mut node, 1, now).unwrap();
+    }
 
     #[test]
     fn client_default_ice_timeout() {

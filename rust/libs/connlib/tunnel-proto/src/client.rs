@@ -1053,8 +1053,10 @@ impl ClientState {
             .remove_remote_candidate(conn_id.into(), ice_candidate.into(), now);
     }
 
-    #[tracing::instrument(level = "debug", skip_all, fields(%rid))]
     /// `None` disables flow-log attribution for control planes without an ingest service.
+    ///
+    /// Both applied and ignored authorizations return success for compatibility.
+    /// Use [`Self::handle_resource_access_authorized_with_status`] to distinguish them.
     pub fn handle_resource_access_authorized(
         &mut self,
         rid: ResourceId,
@@ -1069,6 +1071,42 @@ impl ClientState {
         flow_logs_ingest_token: impl Into<Option<IngestToken>>,
         now: Instant,
     ) -> anyhow::Result<Result<(), NoTurnServers>> {
+        self.handle_resource_access_authorized_with_status(
+            rid,
+            gid,
+            gateway_key,
+            gateway_tun,
+            site_id,
+            preshared_key,
+            client_ice,
+            gateway_ice,
+            use_iceless,
+            flow_logs_ingest_token,
+            now,
+        )
+        .map(|result| result.map(|_| ()))
+    }
+
+    /// Applies an authorization only while traffic or DNS queries still need it.
+    ///
+    /// `Applied` means the native authorization was installed, not that ICE or
+    /// the WireGuard handshake has completed. `NoTurnServers` preserves the
+    /// pending request and its traffic so the same authorization can be retried.
+    #[tracing::instrument(level = "debug", skip_all, fields(%rid))]
+    pub fn handle_resource_access_authorized_with_status(
+        &mut self,
+        rid: ResourceId,
+        gid: GatewayId,
+        gateway_key: PublicKey,
+        gateway_tun: IpConfig,
+        site_id: SiteId,
+        preshared_key: SecretKey,
+        client_ice: IceCredentials,
+        gateway_ice: IceCredentials,
+        use_iceless: bool,
+        flow_logs_ingest_token: impl Into<Option<IngestToken>>,
+        now: Instant,
+    ) -> anyhow::Result<Result<crate::ResourceAuthorizationStatus, NoTurnServers>> {
         tracing::debug!(%gid, "New resource access authorized");
 
         let resource = self.resources_by_id.get(&rid).context("Unknown resource")?;
@@ -1077,16 +1115,13 @@ impl ClientState {
             "Device pool cannot be authorized through a gateway"
         );
 
-        let pending_authorizations = self
-            .pending_authorizations
-            .remove_resource_authorizations(rid);
-        if pending_authorizations.is_empty() {
+        if !self.pending_authorizations.has_resource_authorizations(rid) {
             tracing::debug!("No pending authorization");
 
-            return Ok(Ok(()));
+            return Ok(Ok(crate::ResourceAuthorizationStatus::Ignored));
         }
 
-        match self.node.upsert_connection(
+        match self.node.upsert_connection_with_status(
             ClientOrGatewayId::Gateway(gid),
             gateway_key,
             x25519::StaticSecret::from(preshared_key.expose_secret().0),
@@ -1098,9 +1133,21 @@ impl ClientState {
             use_iceless,
             now,
         ) {
-            Ok(()) => {}
+            Ok(snownet::ConnectionUpsert::Created) => {
+                let conn = ClientOrGatewayId::Gateway(gid);
+                self.portal.forget(&conn);
+                self.buffered_events.retain(|event| match event {
+                    ClientEvent::AddedIceCandidates { conn_id, .. }
+                    | ClientEvent::RemovedIceCandidates { conn_id, .. } => *conn_id != conn,
+                    _ => true,
+                });
+            }
+            Ok(snownet::ConnectionUpsert::Reused) => {}
             Err(e) => return Ok(Err(e)),
         };
+        let pending_authorizations = self
+            .pending_authorizations
+            .remove_resource_authorizations(rid);
         self.outbound_authorizations
             .authorize_gateway(rid, gid, flow_logs_ingest_token);
         self.gateways_by_site
@@ -1172,7 +1219,7 @@ impl ClientState {
             );
         }
 
-        Ok(Ok(()))
+        Ok(Ok(crate::ResourceAuthorizationStatus::Applied))
     }
 
     pub fn handle_client_device_access_authorized(
@@ -1199,7 +1246,7 @@ impl ClientState {
             return Ok(());
         };
 
-        self.node.upsert_connection(
+        let connection = self.node.upsert_connection_with_status(
             ClientOrGatewayId::Client(cid),
             client_key,
             x25519::StaticSecret::from(preshared_key.expose_secret().0),
@@ -1211,6 +1258,16 @@ impl ClientState {
             use_iceless,
             now,
         )?;
+
+        if connection == snownet::ConnectionUpsert::Created {
+            let conn = ClientOrGatewayId::Client(cid);
+            self.portal.forget(&conn);
+            self.buffered_events.retain(|event| match event {
+                ClientEvent::AddedIceCandidates { conn_id, .. }
+                | ClientEvent::RemovedIceCandidates { conn_id, .. } => *conn_id != conn,
+                _ => true,
+            });
+        }
 
         let authorization = authorization.map(|auth| {
             let expires_at = auth
@@ -2121,35 +2178,57 @@ impl ClientState {
                 });
             }
             resource_stub_resolver::ResolveStrategy::RecurseSite(resources) => {
-                let gateway_id = resources.iter().find_map(|resource| {
-                    self.outbound_authorizations
-                        .gateway_by_resource(*resource)
-                        .copied()
-                });
-                let Some(gateway) = gateway_id.and_then(|id| self.gateways.peer_by_id_mut(&id))
-                else {
-                    self.pending_authorizations.on_not_authorized(
-                        AuthorizationRequest::Resources(resources),
-                        DnsQueryForSite {
-                            local,
-                            remote,
-                            transport,
-                            message,
-                        },
-                        now,
-                    );
-                    return None;
-                };
-
-                let server = gateway.tun_dns_server_endpoint(local.ip());
-
-                self.forward_dns_query_to_new_upstream_via_tunnel(
-                    local, remote, server, message, transport, now,
-                );
+                self.handle_dns_query_for_site(resources, DnsQueryForSite {
+                    local, remote, transport, message,
+                }, now);
             }
         };
 
         None
+    }
+
+    fn handle_dns_query_for_site(&mut self, resources: Vec<ResourceId>, query: DnsQueryForSite, now: Instant) {
+        let gateway_id = resources.iter().find_map(|resource| {
+            self.outbound_authorizations.gateway_by_resource(*resource).copied()
+        });
+        let Some(gateway) = gateway_id.and_then(|id| self.gateways.peer_by_id_mut(&id)) else {
+            self.pending_authorizations.on_not_authorized(
+                AuthorizationRequest::Resources(resources), query, now,
+            );
+            return;
+        };
+        let server = gateway.tun_dns_server_endpoint(query.local.ip());
+        self.forward_dns_query_to_new_upstream_via_tunnel(
+            query.local, query.remote, server, query.message, query.transport, now,
+        );
+    }
+
+    fn refresh_pending_dns_authorizations(&mut self, now: Instant) {
+        let dns_resources = self.resources_by_id.iter().filter_map(|(id, resource)| {
+            matches!(resource, Resource::Dns(_)).then_some(*id)
+        }).collect();
+        let pending = self.pending_authorizations.take_resource_authorizations(&dns_resources);
+        for pending in pending {
+            let (packets, queries) = pending.into_buffers();
+            for packet in packets {
+                if let Err(error) = self.handle_out_of_band_ip_packet(packet, now) {
+                    tracing::debug!("Failed to re-route buffered DNS resource packet: {error:#}");
+                }
+            }
+            for query in queries {
+                match self.resource_stub_resolver.handle_query(&query.message) {
+                    resource_stub_resolver::ResolveStrategy::RecurseSite(resources) => {
+                        self.handle_dns_query_for_site(resources, query, now);
+                    }
+                    _ => {
+                        // A former site query must not leak to the local resolver
+                        // when its resource disappears or stops matching.
+                        self.send_dns_response(query.local, query.remote, query.transport,
+                            dns_types::Response::servfail(&query.message));
+                    }
+                }
+            }
+        }
     }
 
     fn forward_dns_query_to_new_upstream_via_tunnel(
@@ -2300,10 +2379,12 @@ impl ClientState {
                         .insert(candidate.into());
                 }
                 snownet::Event::ConnectionEstablished(ClientOrGatewayId::Gateway(id)) => {
+                    tracing::info!(gateway_id = %id, "Native connection established: WireGuard handshake and nominated socket ready");
                     self.flush_pending_packets(ClientOrGatewayId::Gateway(id), now);
                     self.update_site_status_by_gateway(&id, ResourceStatus::Online, now);
                 }
                 snownet::Event::ConnectionEstablished(ClientOrGatewayId::Client(id)) => {
+                    tracing::info!(client_id = %id, "Native connection established: WireGuard handshake and nominated socket ready");
                     self.flush_pending_packets(ClientOrGatewayId::Client(id), now);
                     self.resource_list.update(self.resource_list_snapshot());
                 }
@@ -2608,6 +2689,9 @@ impl ClientState {
                 );
 
                 self.update_dns_resource_routes(result.routes);
+                if result.is_new {
+                    self.refresh_pending_dns_authorizations(now);
+                }
 
                 result.is_new
             }
@@ -3049,6 +3133,354 @@ fn test_ingest_token() -> IngestToken {
 mod tests {
     use super::*;
     use crate::messages::PortRange;
+
+    fn authorize_resource_without_new_request(
+        state: &mut ClientState,
+        now: Instant,
+    ) -> Result<crate::ResourceAuthorizationStatus, NoTurnServers> {
+        state
+            .handle_resource_access_authorized_with_status(
+                ResourceId::from_u128(1),
+                GatewayId::from_u128(1),
+                PublicKey::from(&x25519::StaticSecret::from([9; 32])),
+                IpConfig {
+                    v4: device_tun_ipv4(),
+                    v6: "fd00:2021:1111::2".parse().unwrap(),
+                },
+                SiteId::from_u128(1),
+                Box::new(crate::messages::Key([2; 32])).into(),
+                IceCredentials {
+                    username: "local-2".into(),
+                    password: "password".into(),
+                },
+                IceCredentials {
+                    username: "remote-2".into(),
+                    password: "password".into(),
+                },
+                false,
+                None,
+                now,
+            )
+            .unwrap()
+    }
+
+    #[test_case::test_case(false; "no_connection")]
+    #[test_case::test_case(true; "existing_connection")]
+    fn authorization_without_pending_request_does_not_install_connection(existing: bool) {
+        let now = Instant::now();
+        let mut state = ClientState::for_test();
+        state.update_interface_config(interface(own_tun_ipv4(), own_tun_ipv6()));
+        let resource = ResourceId::from_u128(1);
+        state.upsert_resource(
+            Resource::Cidr(resource::CidrResource {
+                id: resource,
+                address: "172.20.0.0/16".parse().unwrap(),
+                name: "private".into(),
+                address_description: None,
+                sites: vec![],
+                filters: vec![],
+            }),
+            now,
+        );
+        crate::test_utils::discover_relay(&mut state.node, now);
+        let now = now + Duration::from_millis(2);
+        if existing {
+            authorize_candidate_peer(&mut state, false, 1, now).unwrap();
+        }
+        state.drain_node_events(now);
+        while state.poll_event().is_some() {}
+        assert_eq!(
+            authorize_resource_without_new_request(&mut state, now).unwrap(),
+            crate::ResourceAuthorizationStatus::Ignored,
+        );
+        assert_eq!(
+            state.gateway_by_resource(&resource),
+            existing.then(|| GatewayId::from_u128(1)),
+        );
+        state.drain_node_events(now);
+        assert!(
+            state.poll_event().is_none(),
+            "ignored authorization must not emit connection events",
+        );
+    }
+
+    #[test_case::test_case(false; "retry")]
+    #[test_case::test_case(true; "revoked_before_retry")]
+    fn authorization_retries_after_no_relays_without_new_traffic(revoked: bool) {
+        let now = Instant::now();
+        let mut state = ClientState::for_test();
+        state.update_interface_config(interface(own_tun_ipv4(), own_tun_ipv6()));
+        let resource = ResourceId::from_u128(1);
+        state.upsert_resource(
+            Resource::Cidr(resource::CidrResource {
+                id: resource,
+                address: "172.20.0.0/16".parse().unwrap(),
+                name: "private".into(),
+                address_description: None,
+                sites: vec![],
+                filters: vec![],
+            }),
+            now,
+        );
+        assert!(authorize_candidate_peer(&mut state, false, 2, now).is_err());
+        assert_eq!(state.gateway_by_resource(&resource), None);
+        assert!(state.pending_authorizations.has_resource_authorizations(resource));
+        if revoked {
+            let definition = state.resources_by_id[&resource].clone();
+            state.remove_resource(resource, now);
+            state.upsert_resource(definition, now);
+        }
+        crate::test_utils::discover_relay(&mut state.node, now);
+        assert_eq!(
+            authorize_resource_without_new_request(&mut state, now + Duration::from_millis(2)).unwrap(),
+            if revoked {
+                crate::ResourceAuthorizationStatus::Ignored
+            } else {
+                crate::ResourceAuthorizationStatus::Applied
+            },
+        );
+        assert_eq!(
+            state.gateway_by_resource(&resource),
+            (!revoked).then(|| GatewayId::from_u128(1)),
+        );
+        assert!(!state.pending_authorizations.has_resource_authorizations(resource));
+    }
+
+    #[test]
+    fn new_dns_candidate_refreshes_buffered_traffic_without_a_new_query_or_packet() {
+        let now = Instant::now();
+        let mut state = ClientState::for_test();
+        state.update_interface_config(interface(own_tun_ipv4(), own_tun_ipv6()));
+        let resource = |id, address: &str| Resource::Dns(resource::DnsResource {
+            id: ResourceId::from_u128(id), address: address.into(), name: address.into(),
+            address_description: None, sites: vec![], ip_stack: connlib_model::IpStack::Dual,
+            filters: vec![],
+        });
+        state.upsert_resource(resource(1, "db.example.com"), now);
+        let query = dns_types::Query::new("db.example.com".parse().unwrap(), dns_types::RecordType::A);
+        let resource_stub_resolver::ResolveStrategy::LocalResponse { routes, .. } =
+            state.resource_stub_resolver.handle_query(&query) else { panic!("DNS must be local") };
+        let proxy = routes[0].proxy_ips[0];
+        state.update_dns_resource_routes(routes);
+        state.handle_out_of_band_ip_packet(ip_packet::make::udp_packet(
+            own_tun_ipv4(), proxy, 1234, 8000, &[1]).unwrap(), now).unwrap();
+        assert_eq!(state.pending_authorizations.poll_authorization_requests(),
+            Some(AuthorizationRequest::resources([ResourceId::from_u128(1)])));
+        state.upsert_resource(resource(2, "*.example.com"), now);
+        assert_eq!(state.pending_authorizations.poll_authorization_requests(),
+            Some(AuthorizationRequest::resources([ResourceId::from_u128(1), ResourceId::from_u128(2)])));
+        assert!(state.pending_authorizations.poll_authorization_requests().is_none());
+        assert_eq!(state.gateway_by_resource(&ResourceId::from_u128(2)), None,
+            "candidate refresh is not authorization");
+        assert_eq!(state.resource_stub_resolver.resolved_resources().next().unwrap().2[0], proxy);
+    }
+
+    #[test]
+    fn new_dns_candidate_refreshes_pending_site_queries_and_clears_obsolete_requests() {
+        for kind in [dns_types::RecordType::SRV, dns_types::RecordType::TXT] {
+            let now = Instant::now();
+            let mut state = ClientState::for_test();
+            let resource = |id, address: &str| Resource::Dns(resource::DnsResource {
+                id: ResourceId::from_u128(id), address: address.into(), name: address.into(),
+                address_description: None, sites: vec![], ip_stack: connlib_model::IpStack::Dual,
+                filters: vec![],
+            });
+            state.upsert_resource(resource(1, "db.example.com"), now);
+            state.handle_dns_query_for_site(vec![ResourceId::from_u128(1)], DnsQueryForSite {
+                local: "100.100.111.1:53".parse().unwrap(),
+                remote: "100.64.0.1:1234".parse().unwrap(),
+                transport: dns::Transport::Udp,
+                message: dns_types::Query::new("db.example.com".parse().unwrap(), kind),
+            }, now);
+            // Leave the old request queued: refresh must replace, not append to it.
+            state.upsert_resource(resource(2, "*.example.com"), now);
+            assert_eq!(state.pending_authorizations.poll_authorization_requests(),
+                Some(AuthorizationRequest::resources([ResourceId::from_u128(1), ResourceId::from_u128(2)])));
+            assert!(state.pending_authorizations.poll_authorization_requests().is_none());
+            let pending = state.pending_authorizations.remove_resource_authorizations(ResourceId::from_u128(2));
+            assert_eq!(pending.len(), 1);
+            let (_, queries) = pending.into_iter().next().unwrap().into_buffers();
+            assert_eq!(queries.into_iter().count(), 1);
+        }
+    }
+
+    fn authorize_candidate_peer(
+        state: &mut ClientState,
+        device: bool,
+        version: u8,
+        now: Instant,
+    ) -> Result<(), NoTurnServers> {
+        let key = PublicKey::from(&x25519::StaticSecret::from([9; 32]));
+        let secret = Box::new(crate::messages::Key([version; 32])).into();
+        let local_ice = IceCredentials {
+            username: format!("local-{version}"),
+            password: "password".into(),
+        };
+        let remote_ice = IceCredentials {
+            username: format!("remote-{version}"),
+            password: "password".into(),
+        };
+        let tun = IpConfig {
+            v4: device_tun_ipv4(),
+            v6: "fd00:2021:1111::2".parse().unwrap(),
+        };
+        if device {
+            return state.handle_client_device_access_authorized(
+                ClientId::from_u128(1),
+                key,
+                tun,
+                secret,
+                local_ice,
+                remote_ice,
+                IceRole::Controlling,
+                false,
+                "peer".into(),
+                None,
+                None,
+                test_ingest_token(),
+                now,
+            );
+        }
+        let resource = ResourceId::from_u128(1);
+        state.pending_authorizations.on_not_authorized(
+            AuthorizationRequest::resources([resource]),
+            ip_packet::make::udp_packet(
+                own_tun_ipv4(),
+                "172.20.0.1".parse::<Ipv4Addr>().unwrap(),
+                1234,
+                80,
+                &[1],
+            )
+            .unwrap(),
+            now,
+        );
+        state
+            .handle_resource_access_authorized(
+                resource,
+                GatewayId::from_u128(1),
+                key,
+                tun,
+                SiteId::from_u128(1),
+                secret,
+                local_ice,
+                remote_ice,
+                false,
+                None,
+                now,
+            )
+            .unwrap()
+    }
+
+    #[test_case::test_case(false, false, false; "gateway_replacement")]
+    #[test_case::test_case(false, true, false; "gateway_reuse")]
+    #[test_case::test_case(false, false, true; "gateway_no_relays")]
+    #[test_case::test_case(true, false, false; "device_replacement")]
+    #[test_case::test_case(true, true, false; "device_reuse")]
+    #[test_case::test_case(true, false, true; "device_no_relays")]
+    fn authorization_preserves_only_current_connection_candidates(
+        device: bool,
+        reuse: bool,
+        no_relays: bool,
+    ) {
+        let now = Instant::now();
+        let mut state = ClientState::for_test();
+        state.update_interface_config(interface(own_tun_ipv4(), own_tun_ipv6()));
+        state.upsert_resource(
+            Resource::Cidr(resource::CidrResource {
+                id: ResourceId::from_u128(1),
+                address: "172.20.0.0/16".parse().unwrap(),
+                name: "private".into(),
+                address_description: None,
+                sites: vec![],
+                filters: vec![],
+            }),
+            now,
+        );
+        crate::test_utils::discover_relay(&mut state.node, now);
+        let now = now + Duration::from_millis(2);
+        authorize_candidate_peer(&mut state, device, 1, now).unwrap();
+        state.drain_node_events(now);
+        while state.poll_event().is_some() {}
+        let (conn, other) = if device {
+            (
+                ClientOrGatewayId::Client(ClientId::from_u128(1)),
+                ClientOrGatewayId::Gateway(GatewayId::from_u128(1)),
+            )
+        } else {
+            (
+                ClientOrGatewayId::Gateway(GatewayId::from_u128(1)),
+                ClientOrGatewayId::Client(ClientId::from_u128(1)),
+            )
+        };
+        for id in [conn, other] {
+            state
+                .buffered_events
+                .push_back(ClientEvent::AddedIceCandidates {
+                    conn_id: id,
+                    candidates: BTreeSet::from(["queued-added".to_owned().into()]),
+                });
+            state
+                .buffered_events
+                .push_back(ClientEvent::RemovedIceCandidates {
+                    conn_id: id,
+                    candidates: BTreeSet::from(["queued-removed".to_owned().into()]),
+                });
+        }
+        state.set_portal_connected(false);
+        for id in [conn, other] {
+            state.portal.hold_added(id, "held-added".to_owned().into());
+            state
+                .portal
+                .hold_removed(id, "held-removed".to_owned().into());
+        }
+        if no_relays {
+            state.node.update_relays(
+                BTreeSet::from([RelayId::from_u128(1)]),
+                &BTreeSet::new(),
+                now,
+            );
+        }
+        let result = authorize_candidate_peer(&mut state, device, if reuse { 1 } else { 2 }, now);
+        assert_eq!(result.is_err(), no_relays);
+        state.set_portal_connected(true);
+        let mut retained = Vec::new();
+        while let Some(event) = state.poll_event() {
+            if let ClientEvent::AddedIceCandidates {
+                conn_id,
+                candidates,
+            }
+            | ClientEvent::RemovedIceCandidates {
+                conn_id,
+                candidates,
+            } = event
+            {
+                retained.extend(candidates.into_iter().map(|c| (conn_id, c)));
+            }
+        }
+        for label in [
+            "queued-added",
+            "queued-removed",
+            "held-added",
+            "held-removed",
+        ] {
+            let candidate: IceCandidate = label.to_owned().into();
+            assert!(retained.contains(&(other, candidate.clone())));
+            assert_eq!(
+                retained.contains(&(conn, candidate)),
+                reuse || no_relays,
+                "{label}"
+            );
+        }
+        if !reuse && !no_relays {
+            state.drain_node_events(now);
+            assert!(
+                std::iter::from_fn(|| state.poll_event()).any(|event| matches!(event,
+                    ClientEvent::AddedIceCandidates { candidates, .. } if !candidates.is_empty()
+                )),
+                "replacement must still signal its new candidates"
+            );
+        }
+    }
 
     #[test]
     fn does_not_queue_device_access_intent_for_packet_to_own_tun_ipv4() {

@@ -211,11 +211,14 @@ impl ResourceStubResolver {
         self.dns_resources.insert(resource.clone());
 
         let mut records_changed = false;
-        for (_, resources) in self.fqdn_to_ips.values_mut() {
+        for (domain, (_, resources)) in &mut self.fqdn_to_ips {
             for _ in resources.extract_if(.., |(pattern, rid)| {
                 *rid == id && pattern != &resource.pattern
             }) {
                 records_changed = true;
+            }
+            if resource.pattern.matches(&Candidate::from_domain(domain)) {
+                records_changed |= resources.insert((resource.pattern.clone(), id));
             }
         }
 
@@ -245,6 +248,15 @@ impl ResourceStubResolver {
     pub(crate) fn remove_resource(&mut self, id: ResourceId) {
         for r in self.dns_resources.extract_if(.., |r| r.id == id) {
             drop(r)
+        }
+        let mut changed = false;
+        for (_, resources) in self.fqdn_to_ips.values_mut() {
+            let before = resources.len();
+            resources.retain(|(_, rid)| *rid != id);
+            changed |= resources.len() != before;
+        }
+        if changed {
+            self.events.push_back(Event::RecordsChanged(self.records()));
         }
     }
 
@@ -618,6 +630,31 @@ mod tests {
         let matches = pattern.matches(&candidate);
 
         assert!(!matches);
+    }
+
+    #[test]
+    fn newly_matching_resource_updates_existing_proxy_assignment() {
+        let domain = "db.example.com".parse::<DomainName>().unwrap();
+        let original = ResourceId::from_u128(1);
+        let added = ResourceId::from_u128(2);
+        let proxy_ip: IpAddr = "100.96.0.1".parse().unwrap();
+        let mut resolver = ResourceStubResolver::new(BTreeSet::from([DnsResourceRecord {
+            domain: domain.clone(),
+            resources: BTreeSet::from([(Pattern::new("db.example.com").unwrap(), original)]),
+            ips: vec![proxy_ip],
+        }]));
+        resolver.add_resource(original, "db.example.com".into(), IpStack::Dual);
+        let result = resolver.add_resource(added, "*.example.com".into(), IpStack::Dual);
+        assert_eq!(result.routes.len(), 1);
+        assert_eq!(result.routes[0].proxy_ips.as_slice(), &[proxy_ip]);
+        assert_eq!(result.routes[0].domain, domain);
+        assert_eq!(resolver.resolved_resources().map(|(_, id, _)| *id).collect_vec(), vec![original, added]);
+        assert!(matches!(resolver.poll_event(), Some(Event::RecordsChanged(_))));
+        assert!(resolver.add_resource(added, "*.example.com".into(), IpStack::Dual).routes.is_empty());
+        resolver.remove_resource(original);
+        assert_eq!(resolver.resolved_resources().map(|(_, id, _)| *id).collect_vec(), vec![added]);
+        resolver.add_resource(added, "*.other.com".into(), IpStack::Dual);
+        assert_eq!(resolver.resolved_resources().count(), 0);
     }
 
     #[test]

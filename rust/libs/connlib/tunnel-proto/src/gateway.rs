@@ -266,6 +266,13 @@ impl GatewayState {
         self.node.close_connection(*id, p2p_control::goodbye(), now);
     }
 
+    /// Whether the native transport exists, including during negotiation.
+    /// Resource authorizations can outlive that transport and are not sufficient
+    /// to confirm that a candidate update was applied to a live connection.
+    pub fn has_connection(&self, client: &ClientId) -> bool {
+        self.node.has_connection(client)
+    }
+
     pub fn add_ice_candidate(
         &mut self,
         conn_id: ClientId,
@@ -321,7 +328,7 @@ impl GatewayState {
         now: Instant,
         flow_logs_ingest_token: impl Into<Option<IngestToken>>,
     ) -> Result<(), NoTurnServers> {
-        self.node.upsert_connection(
+        let connection = self.node.upsert_connection_with_status(
             client.id,
             client.public_key.into(),
             x25519::StaticSecret::from(client.preshared_key.expose_secret().0),
@@ -333,6 +340,15 @@ impl GatewayState {
             use_iceless,
             now,
         )?;
+
+        if connection == snownet::ConnectionUpsert::Created {
+            self.portal.forget(&client.id);
+            self.buffered_events.retain(|event| match event {
+                GatewayEvent::AddedIceCandidates { conn_id, .. }
+                | GatewayEvent::RemovedIceCandidates { conn_id, .. } => *conn_id != client.id,
+                _ => true,
+            });
+        }
 
         let result = self.allow_access(
             client.id,
@@ -540,7 +556,9 @@ impl GatewayState {
                         .or_default()
                         .insert(candidate.into());
                 }
-                snownet::Event::ConnectionEstablished(_) => {}
+                snownet::Event::ConnectionEstablished(id) => {
+                    tracing::info!(client_id = %id, "Native connection established: WireGuard handshake and nominated socket ready");
+                }
                 snownet::Event::NoRelays => {
                     self.buffered_events.push_back(GatewayEvent::NoRelays);
                 }
@@ -728,5 +746,173 @@ impl ResolveDnsRequest {
 
     pub fn proxy_ips(&self) -> &[IpAddr] {
         &self.proxy_ips
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::messages::{Key, gateway::ResourceDescriptionCidr};
+
+    fn authorize(state: &mut GatewayState, version: u8, now: Instant) -> Result<(), NoTurnServers> {
+        state.create_authorization(
+            Client {
+                id: ClientId::from_u128(1),
+                public_key: PublicKey::from(&x25519::StaticSecret::from([9; 32])).into(),
+                preshared_key: Box::new(Key([version; 32])).into(),
+                ipv4: "100.65.0.1".parse().unwrap(),
+                ipv6: "fd00:2021:1111::1".parse().unwrap(),
+            },
+            IceCredentials {
+                username: format!("client-{version}"),
+                password: "password".into(),
+            },
+            IceCredentials {
+                username: format!("gateway-{version}"),
+                password: "password".into(),
+            },
+            None,
+            ResourceDescription::Cidr(ResourceDescriptionCidr {
+                id: ResourceId::from_u128(version.into()),
+                address: "172.20.0.0/16".parse().unwrap(),
+                name: "private".into(),
+                filters: vec![],
+            }),
+            false,
+            now,
+            None,
+        )
+    }
+
+    #[test]
+    fn transport_presence_does_not_follow_retained_resource_authorization() {
+        let now = Instant::now();
+        let mut state = GatewayState::new([8; 32], now, Duration::ZERO);
+        state.update_tun_device(IpConfig {
+            v4: "100.64.0.1".parse().unwrap(),
+            v6: "fd00:2021:1111::2".parse().unwrap(),
+        });
+        let client = ClientId::from_u128(1);
+        assert!(authorize(&mut state, 1, now).is_err());
+        assert!(!state.has_connection(&client));
+        crate::test_utils::discover_relay(&mut state.node, now);
+        let now = now + Duration::from_millis(2);
+        authorize(&mut state, 1, now).unwrap();
+        assert!(state.has_connection(&client), "negotiating connections accept candidates");
+        assert!(!state.node.is_connected(&client));
+        assert!(!state.has_connection(&ClientId::from_u128(2)));
+
+        let _ = state.poll_timeout();
+        let expired = now + Duration::from_secs(11);
+        state.handle_timeout(expired);
+        assert!(!state.has_connection(&client));
+        // Resource state intentionally survives native setup failure.
+        state.update_access_authorization_expiry(
+            client, ResourceId::from_u128(1), Duration::from_secs(60), expired,
+        ).unwrap();
+        assert!(!state.has_connection(&client));
+
+        authorize(&mut state, 2, expired).unwrap();
+        assert!(state.has_connection(&client));
+        state.remove_access(&client, &ResourceId::from_u128(1), expired);
+        assert!(state.has_connection(&client));
+        state.remove_access(&client, &ResourceId::from_u128(2), expired);
+        assert!(!state.has_connection(&client));
+    }
+
+    #[test_case::test_case(false, false; "replacement")]
+    #[test_case::test_case(true, false; "reuse")]
+    #[test_case::test_case(false, true; "no_relays")]
+    fn authorization_preserves_only_current_connection_candidates(reuse: bool, no_relays: bool) {
+        let now = Instant::now();
+        let mut state = GatewayState::new([8; 32], now, Duration::ZERO);
+        state.update_tun_device(IpConfig {
+            v4: "100.64.0.1".parse().unwrap(),
+            v6: "fd00:2021:1111::2".parse().unwrap(),
+        });
+        crate::test_utils::discover_relay(&mut state.node, now);
+        let now = now + Duration::from_millis(2);
+        authorize(&mut state, 1, now).unwrap();
+        state.drain_node_events();
+        while state.poll_event().is_some() {}
+        let client = ClientId::from_u128(1);
+        let other = ClientId::from_u128(2);
+        for id in [client, other] {
+            state
+                .buffered_events
+                .push_back(GatewayEvent::AddedIceCandidates {
+                    conn_id: id,
+                    candidates: BTreeSet::from(["queued-added".to_owned().into()]),
+                });
+            state
+                .buffered_events
+                .push_back(GatewayEvent::RemovedIceCandidates {
+                    conn_id: id,
+                    candidates: BTreeSet::from(["queued-removed".to_owned().into()]),
+                });
+        }
+        state.set_portal_connected(false);
+        for id in [client, other] {
+            state.portal.hold_added(id, "held-added".to_owned().into());
+            state
+                .portal
+                .hold_removed(id, "held-removed".to_owned().into());
+        }
+        if no_relays {
+            state.node.update_relays(
+                BTreeSet::from([RelayId::from_u128(1)]),
+                &BTreeSet::new(),
+                now,
+            );
+        }
+        let result = authorize(&mut state, if reuse { 1 } else { 2 }, now);
+        assert_eq!(result.is_err(), no_relays);
+        state.set_portal_connected(true);
+        let mut retained = Vec::new();
+        while let Some(event) = state.poll_event() {
+            if let GatewayEvent::AddedIceCandidates {
+                conn_id,
+                candidates,
+            }
+            | GatewayEvent::RemovedIceCandidates {
+                conn_id,
+                candidates,
+            } = event
+            {
+                retained.extend(candidates.into_iter().map(|c| (conn_id, c)));
+            }
+        }
+        for label in [
+            "queued-added",
+            "queued-removed",
+            "held-added",
+            "held-removed",
+        ] {
+            let candidate: IceCandidate = label.to_owned().into();
+            assert!(retained.contains(&(other, candidate.clone())));
+            assert_eq!(
+                retained.contains(&(client, candidate)),
+                reuse || no_relays,
+                "{label}"
+            );
+        }
+        // Replacing a transport must not discard another resource on this peer.
+        state
+            .update_access_authorization_expiry(
+                client,
+                ResourceId::from_u128(1),
+                Duration::from_secs(60),
+                now,
+            )
+            .unwrap();
+        if !reuse && !no_relays {
+            state.drain_node_events();
+            assert!(
+                std::iter::from_fn(|| state.poll_event()).any(|event| matches!(event,
+                    GatewayEvent::AddedIceCandidates { candidates, .. } if !candidates.is_empty()
+                )),
+                "replacement must still signal its new candidates"
+            );
+        }
     }
 }

@@ -35,6 +35,8 @@ mod packet_kind;
 mod peer_store;
 mod portal_connection;
 #[cfg(test)]
+mod test_utils;
+#[cfg(test)]
 mod proptest;
 mod routing_table;
 mod unique_packet_buffer;
@@ -63,6 +65,16 @@ pub use unroutable_packet::UnroutablePacket;
 // TODO: Evaluate moving the data types shared by `tunnel-proto`, `tunnel`, and
 // their consumers into `connlib-model` so this crate can expose only the
 // state-machine API.
+
+/// Outcome of applying a resource authorization to the native client state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceAuthorizationStatus {
+    /// The authorization was installed on a new or reused connection.
+    /// This does not imply that the peer is reachable yet.
+    Applied,
+    /// No pending request remained; existing connection state was not changed.
+    Ignored,
+}
 
 #[derive(Debug)]
 pub enum ClientEvent {

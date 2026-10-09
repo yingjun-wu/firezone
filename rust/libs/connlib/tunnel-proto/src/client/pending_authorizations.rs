@@ -80,16 +80,42 @@ impl PendingAuthorizations {
         self.upsert(request.target(), request, trigger.into(), now);
     }
 
+    pub(super) fn has_resource_authorizations(&self, resource: ResourceId) -> bool {
+        self.inner.keys().any(|target| {
+            matches!(target, AuthorizationTarget::Resources(resources) if resources.contains(&resource))
+        })
+    }
+
     /// Removes every pending request that includes `resource` among its candidates.
     pub fn remove_resource_authorizations(
         &mut self,
         resource: ResourceId,
     ) -> Vec<PendingAuthorization> {
+        self.authorization_requests.retain(|request| {
+            !matches!(request, AuthorizationRequest::Resources(resources) if resources.contains(&resource))
+        });
         self.remove_matching(|target| match target {
             AuthorizationTarget::Resources(resources) => resources.contains(&resource),
             AuthorizationTarget::Device { .. } => false,
         })
         .collect()
+    }
+
+    /// Re-route buffered DNS traffic after its set of matching resources changes.
+    /// Device and unrelated CIDR/Internet requests keep their retry state.
+    pub(super) fn take_resource_authorizations(
+        &mut self,
+        affected: &BTreeSet<ResourceId>,
+    ) -> Vec<PendingAuthorization> {
+        let removed = self.inner.extract_if(.., |target, pending| {
+            // NoAuthorization carries no destination to re-route. Preserve its
+            // request and retry state until traffic supplies that information.
+            (pending.packets.len() > 0 || !pending.dns_queries.is_empty())
+                && matches!(target, AuthorizationTarget::Resources(resources)
+                    if resources.iter().any(|id| affected.contains(id)))
+        }).collect::<BTreeMap<_, _>>();
+        self.authorization_requests.retain(|request| !removed.contains_key(&request.target()));
+        removed.into_values().collect()
     }
 
     /// Removes pending device requests that named `pool` among their candidates.
@@ -305,6 +331,35 @@ mod tests {
         let (packets, queries) = removed.into_buffers();
         assert!(packets.into_iter().next().is_none());
         assert!(queries.is_empty());
+    }
+
+    #[test]
+    fn refresh_keeps_unrelated_resource_and_device_requests() {
+        let now = Instant::now();
+        let mut pending = PendingAuthorizations::default();
+        let dns = ResourceId::from_u128(1);
+        let cidr = ResourceId::from_u128(2);
+        pending.on_not_authorized(resource_request(dns), udp_trigger(1), now);
+        pending.on_not_authorized(resource_request(cidr), udp_trigger(2), now);
+        pending.on_not_authorized(device_request(device_ip()), udp_trigger(3), now);
+        assert_eq!(pending.take_resource_authorizations(&BTreeSet::from([dns])).len(), 1);
+        assert_eq!(pending.poll_authorization_requests(), Some(resource_request(cidr)));
+        assert_eq!(pending.poll_authorization_requests(), Some(device_request(device_ip())));
+        assert!(pending.poll_authorization_requests().is_none());
+        assert_eq!(pending.remove_resource_authorizations(cidr).len(), 1);
+    }
+
+    #[test]
+    fn refresh_keeps_reauthorization_without_buffered_traffic() {
+        let now = Instant::now();
+        let mut pending = PendingAuthorizations::default();
+        let dns = ResourceId::from_u128(1);
+        pending.on_not_authorized(resource_request(dns), Trigger::NoAuthorization, now);
+        assert!(pending.take_resource_authorizations(&BTreeSet::from([dns])).is_empty());
+        assert_eq!(pending.poll_authorization_requests(), Some(resource_request(dns)));
+        assert!(pending.has_resource_authorizations(dns));
+        pending.on_not_authorized(resource_request(dns), Trigger::NoAuthorization, now + Duration::from_secs(2));
+        assert_eq!(pending.poll_authorization_requests(), Some(resource_request(dns)));
     }
 
     #[test]
