@@ -400,15 +400,7 @@ where
 
         // The new connection can now be installed. Old events must not be interpreted
         // as events for a different transport that happens to use the same ID.
-        self.pending_events.retain(|event| match event {
-            Event::NewIceCandidate { connection, .. }
-            | Event::InvalidateIceCandidate { connection, .. } => *connection != cid,
-            Event::ConnectionEstablished(id)
-            | Event::ConnectionFailed(id)
-            | Event::ConnectionClosed(id) => *id != cid,
-            Event::NoRelays => true,
-        });
-        self.inflight_stun_requests.remove_by_conn_id(cid);
+        self.discard_connection_events(cid);
 
         let existing = self.connections.remove_established(&cid, now);
         let index = self.index.next();
@@ -472,10 +464,25 @@ where
         Ok(ConnectionUpsert::Created)
     }
 
+    /// Discard events and STUN associations that belong to a retired transport.
+    fn discard_connection_events(&mut self, cid: TId) {
+        self.pending_events.retain(|event| match event {
+            Event::NewIceCandidate { connection, .. }
+            | Event::InvalidateIceCandidate { connection, .. } => *connection != cid,
+            Event::ConnectionEstablished(id)
+            | Event::ConnectionFailed(id)
+            | Event::ConnectionClosed(id) => *id != cid,
+            Event::NoRelays => true,
+        });
+        self.inflight_stun_requests.remove_by_conn_id(cid);
+    }
+
     /// Removes a connection by just clearing its local memory.
     #[tracing::instrument(level = "info", skip_all, fields(%cid))]
     pub fn remove_connection(&mut self, cid: TId, reason: impl fmt::Display, now: Instant) {
         self.last_now = now;
+
+        self.discard_connection_events(cid);
 
         let existing = self.connections.remove_established(&cid, now);
 
@@ -2424,7 +2431,9 @@ mod tests {
                 let _ = node.poll_timeout();
                 node.handle_timeout(now + CANDIDATE_TIMEOUT);
                 assert_eq!(
-                    node.connections.get_mut(&1, now + CANDIDATE_TIMEOUT).is_ok(),
+                    node.connections
+                        .get_mut(&1, now + CANDIDATE_TIMEOUT)
+                        .is_ok(),
                     nominated && authenticated,
                     "nominated={nominated}, authenticated={authenticated}",
                 );
@@ -2455,6 +2464,35 @@ mod tests {
         assert_eq!(events, vec![other, Event::NoRelays]);
         assert_eq!(node.inflight_stun_requests.remove(old_request), None);
         assert_eq!(node.inflight_stun_requests.remove(other_request), Some(2));
+    }
+
+    #[test]
+    fn removal_discards_unconsumed_events_and_stun_associations_immediately() {
+        let now = Instant::now();
+        let mut node = connection_node(now);
+        authorize(&mut node, 1, now).unwrap();
+        node.pending_events.extend(old_connection_events());
+        let retired_request = is::stun::TransId::new();
+        let other_request = is::stun::TransId::new();
+        node.inflight_stun_requests.add(1, retired_request, now);
+        node.inflight_stun_requests.add(2, other_request, now);
+        let other = Event::NewIceCandidate {
+            connection: 2,
+            candidate: "other".into(),
+        };
+        node.pending_events.push_back(other.clone());
+        node.pending_events.push_back(Event::NoRelays);
+
+        node.remove_connection(1, "revoked", now);
+        node.remove_connection(1, "already revoked", now);
+
+        assert_eq!(
+            std::iter::from_fn(|| node.poll_event()).collect::<Vec<_>>(),
+            vec![other, Event::NoRelays]
+        );
+        assert_eq!(node.inflight_stun_requests.remove(retired_request), None);
+        assert_eq!(node.inflight_stun_requests.remove(other_request), Some(2));
+        assert!(!node.has_connection(&1));
     }
 
     #[test]
