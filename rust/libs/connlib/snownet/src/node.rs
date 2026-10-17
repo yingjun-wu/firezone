@@ -102,6 +102,7 @@ pub struct Node<TId, RId> {
     inflight_stun_requests: InflightStunRequests<TId>,
 
     pending_events: VecDeque<Event<TId>>,
+    observations: crate::connection_observation::ObservationLog<TId>,
     /// The most recent `now` passed to a mutating API; [`Node::poll_timeout`]
     /// returns it while transmits or events are queued so the driver drains
     /// them without delay.
@@ -215,6 +216,7 @@ where
             rate_limiter: Arc::new(RateLimiter::new_at(public_key, HANDSHAKE_RATE_LIMIT, now)),
             buffered_transmits: TransmitBuffer::default(),
             pending_events: VecDeque::default(),
+            observations: Default::default(),
             last_now: now,
             allocations,
             inflight_stun_requests: Default::default(),
@@ -401,6 +403,7 @@ where
         // The new connection can now be installed. Old events must not be interpreted
         // as events for a different transport that happens to use the same ID.
         self.discard_connection_events(cid);
+        self.observations.begin(cid, !use_iceless, now);
 
         let existing = self.connections.remove_established(&cid, now);
         let index = self.index.next();
@@ -486,10 +489,13 @@ where
 
         let existing = self.connections.remove_established(&cid, now);
 
-        if existing.is_none() {
+        let Some(mut connection) = existing else {
             return;
-        }
+        };
+        Self::observe_connection_stages(&mut self.observations, cid, &mut connection);
 
+        self.observations
+            .terminal(cid, crate::ConnectionStage::Closed, now);
         tracing::info!("Connection removed ({reason})");
     }
 
@@ -506,6 +512,9 @@ where
             return;
         };
 
+        Self::observe_connection_stages(&mut self.observations, cid, &mut connection);
+        self.observations
+            .terminal(cid, crate::ConnectionStage::Closed, now);
         let peer_socket = match connection.state {
             ConnectionState::Connected { peer_socket, .. }
             | ConnectionState::Idle { peer_socket } => peer_socket,
@@ -696,13 +705,72 @@ where
     /// Returns a pending [`Event`] from the pool.
     #[must_use]
     pub fn poll_event(&mut self) -> Option<Event<TId>> {
+        for (id, connection) in self.connections.iter_established_mut() {
+            Self::observe_connection_stages(&mut self.observations, id, connection);
+        }
         let event = self.pending_events.pop_front()?;
+        match &event {
+            Event::ConnectionEstablished(id) => {
+                self.observations
+                    .record(*id, crate::ConnectionStage::Ready, self.last_now)
+            }
+            Event::ConnectionFailed(id) => {
+                self.observations
+                    .terminal(*id, crate::ConnectionStage::Failed, self.last_now)
+            }
+            Event::ConnectionClosed(id) => {
+                self.observations
+                    .terminal(*id, crate::ConnectionStage::Closed, self.last_now)
+            }
+            _ => {}
+        }
 
         if let Event::ConnectionClosed(id) | Event::ConnectionFailed(id) = &event {
             self.inflight_stun_requests.remove_by_conn_id(*id);
         }
 
         Some(event)
+    }
+
+    fn observe_connection_stages(
+        observations: &mut crate::connection_observation::ObservationLog<TId>,
+        id: TId,
+        connection: &mut Connection<RId>,
+    ) {
+        if connection.lifecycle_changes_lost {
+            observations.lost();
+            connection.lifecycle_changes_lost = false;
+        }
+        let mut changes = connection.lifecycle_changes.drain(..).collect::<Vec<_>>();
+        if !connection.agent.is_iceless() {
+            if let Some(at) = connection.first_path_ready_at {
+                changes.push((crate::ConnectionStage::IceReady, at));
+            }
+        }
+        if let Some(at) = connection.first_handshake_started_at {
+            changes.push((crate::ConnectionStage::HandshakeStarted, at));
+        }
+        if let Some(at) = connection.first_handshake_completed_at {
+            changes.push((crate::ConnectionStage::HandshakeCompleted, at));
+        }
+        if let Some((path, handshake)) = connection
+            .first_path_ready_at
+            .zip(connection.first_handshake_completed_at)
+        {
+            changes.push((crate::ConnectionStage::Ready, path.max(handshake)));
+        }
+        changes.sort_by_key(|(_, at)| *at);
+        for (stage, at) in changes {
+            observations.record(id, stage, at);
+        }
+    }
+
+    /// Drain after `poll_event`; observations never contain addresses or secrets.
+    pub fn poll_connection_observation(&mut self) -> Option<crate::ConnectionObservation<TId>> {
+        self.observations.poll()
+    }
+    pub fn dropped_connection_observations(&self) -> u64 {
+        self.observations.dropped()
     }
 
     /// Returns, when [`Node::handle_timeout`] should be called next.
@@ -957,6 +1025,10 @@ where
             disconnected_at: None,
             buffer_pool: self.buffer_pool.clone(),
             last_proactive_handshake_sent_at: None,
+            lifecycle_changes: VecDeque::new(),
+            lifecycle_changes_lost: false,
+            first_path_ready_at: None,
+            first_handshake_started_at: None,
             first_handshake_completed_at: None,
             default_ice_config,
             idle_ice_config,
@@ -1159,6 +1231,7 @@ where
             },
         };
 
+        let had_handshake = conn.first_handshake_completed_at.is_some();
         let control_flow = conn.decapsulate(
             cid,
             from,
@@ -1176,6 +1249,7 @@ where
                 Packet::HandshakeInit(_) | Packet::HandshakeResponse(_)
             )
         {
+            conn.first_handshake_started_at.get_or_insert(now);
             conn.first_handshake_completed_at = Some(now);
 
             tracing::debug!(%cid, duration_since_intent = ?conn.duration_since_intent(now), "Completed wireguard handshake");
@@ -1186,6 +1260,21 @@ where
             if conn.state.has_nominated_socket() {
                 self.pending_events
                     .push_back(Event::ConnectionEstablished(cid))
+            }
+        }
+
+        if had_handshake
+            && matches!(&control_flow, ControlFlow::Break(Ok(())))
+            && matches!(
+                parsed_packet,
+                Packet::HandshakeInit(_) | Packet::HandshakeResponse(_)
+            )
+        {
+            if conn.lifecycle_changes.len() < 8 {
+                conn.lifecycle_changes
+                    .push_back((crate::ConnectionStage::KeyRotated, now));
+            } else {
+                conn.lifecycle_changes_lost = true;
             }
         }
 
@@ -1444,6 +1533,10 @@ struct Connection<RId> {
     intent_sent_at: Instant,
     candidate_timeout: Option<Instant>,
 
+    lifecycle_changes: VecDeque<(crate::ConnectionStage, Instant)>,
+    lifecycle_changes_lost: bool,
+    first_path_ready_at: Option<Instant>,
+    first_handshake_started_at: Option<Instant>,
     first_handshake_completed_at: Option<Instant>,
 
     buffer: Vec<u8>,
@@ -1587,6 +1680,9 @@ where
 
                     let remote_socket =
                         self.peer_socket_for_tuple(allocations, source, destination);
+                    if !matches!(self.state, ConnectionState::Failed) {
+                        self.first_path_ready_at.get_or_insert(now);
+                    }
 
                     let old = match mem::replace(&mut self.state, ConnectionState::Failed) {
                         ConnectionState::Connecting { wg_buffer } => {
@@ -1652,6 +1748,14 @@ where
                         ConnectionState::Failed => continue, // Failed connections are cleaned up, don't bother handling events.
                     };
 
+                    if old.is_some_and(|socket| socket != remote_socket) {
+                        if self.lifecycle_changes.len() < 8 {
+                            self.lifecycle_changes
+                                .push_back((crate::ConnectionStage::PathChanged, now));
+                        } else {
+                            self.lifecycle_changes_lost = true;
+                        }
+                    }
                     let relay = self.relay.id;
 
                     tracing::info!(
@@ -1691,6 +1795,9 @@ where
             let peer_socket = self.peer_socket_for_tuple(allocations, pt.local, pt.remote);
             match pt.payload {
                 path_agent::Payload::Ciphertext(ref bytes) => {
+                    if self.first_handshake_started_at.is_none() && crate::is_handshake(bytes) {
+                        self.first_handshake_started_at = Some(now);
+                    }
                     if let Some(transmit) = make_owned_transmit(
                         self.relay.id,
                         peer_socket,
@@ -1780,6 +1887,9 @@ where
                 tracing::warn!("boringtun error: {e}");
             }
             TunnResult::WriteToNetwork(b) => {
+                if self.first_handshake_started_at.is_none() && crate::is_handshake(b) {
+                    self.first_handshake_started_at = Some(now);
+                }
                 if self.agent.is_iceless() {
                     self.agent.handle_outbound(b.to_vec(), now);
                 } else if let Some(peer_socket) = self.socket() {
@@ -1810,6 +1920,9 @@ where
     ) where
         TId: Copy + fmt::Display,
     {
+        if !matches!(self.state, ConnectionState::Failed) {
+            self.first_path_ready_at.get_or_insert(now);
+        }
         match mem::replace(&mut self.state, ConnectionState::Failed) {
             ConnectionState::Connecting { wg_buffer } => {
                 tracing::debug!(
@@ -1844,6 +1957,12 @@ where
                 last_activity,
             } => {
                 if old != peer_socket {
+                    if self.lifecycle_changes.len() < 8 {
+                        self.lifecycle_changes
+                            .push_back((crate::ConnectionStage::PathChanged, now));
+                    } else {
+                        self.lifecycle_changes_lost = true;
+                    }
                     tracing::info!(%cid, ?old, new = ?peer_socket, "Updating peer socket");
                 }
                 self.state = ConnectionState::Connected {
@@ -1853,6 +1972,12 @@ where
             }
             ConnectionState::Idle { peer_socket: old } => {
                 if old != peer_socket {
+                    if self.lifecycle_changes.len() < 8 {
+                        self.lifecycle_changes
+                            .push_back((crate::ConnectionStage::PathChanged, now));
+                    } else {
+                        self.lifecycle_changes_lost = true;
+                    }
                     tracing::info!(%cid, ?old, new = ?peer_socket, "Updating peer socket");
                 }
                 self.state = ConnectionState::Idle { peer_socket };
@@ -2168,6 +2293,7 @@ where
             return;
         };
 
+        self.first_handshake_started_at.get_or_insert(now);
         self.last_proactive_handshake_sent_at = Some(now);
 
         if let Some(transmit) = make_owned_transmit(

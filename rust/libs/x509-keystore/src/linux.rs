@@ -20,7 +20,7 @@ use sha2::{Digest as _, Sha256, Sha384, Sha512};
 use x509_claims::{ParsedCertificate, SigningAlgorithm, parse_certificate};
 use x509_credential::SigningError;
 
-use crate::{CandidateCertificate, Error, Identity, selected_certificate, sign};
+use crate::{CandidateCertificate, Error, Identity, Pkcs11Selection, selected_certificate, sign};
 use rpc::{Attribute, Mechanism, ReturnValue};
 
 /// The directories p11-kit module configuration is read from, the administrator's first.
@@ -44,6 +44,83 @@ pub(crate) fn identity(subject_cn: &str) -> Result<Option<Identity>, Error> {
     }
 
     identity_on(&p11_kit, &modules, Path::new(PIN_FILE), subject_cn)
+}
+
+pub(crate) fn identity_with_selection(selection: &Pkcs11Selection) -> Result<Identity, Error> {
+    configured_identity(selection).map_err(Error::identity_unavailable)
+}
+
+fn configured_identity(selection: &Pkcs11Selection) -> Result<Identity> {
+    if !selection.module.is_absolute()
+        || !selection.pin_file.is_absolute()
+        || selection
+            .token_label
+            .as_ref()
+            .is_some_and(|s| s.is_empty() || s.len() > 32)
+        || selection
+            .token_serial
+            .as_ref()
+            .is_some_and(|s| s.is_empty() || s.len() > 16)
+        || selection
+            .object_label
+            .as_ref()
+            .is_some_and(|s| s.is_empty() || s.len() > 255)
+        || selection
+            .object_id
+            .as_ref()
+            .is_some_and(|s| s.is_empty() || s.len() > 256)
+        || selection
+            .subject_cn
+            .as_ref()
+            .is_some_and(|s| s.is_empty() || s.len() > 255)
+    {
+        bail!("Invalid PKCS#11 identity selection");
+    }
+    let command = p11_kit_command().context("p11-kit is unavailable")?;
+    let module = rpc::Module::load(&command, &selection.module)
+        .context("Failed to load configured PKCS#11 module")?;
+    let mut selected = None;
+    for slot in module
+        .slots_with_tokens()
+        .context("Failed to enumerate configured PKCS#11 module")?
+    {
+        let info = module
+            .token_info(slot)
+            .context("Failed to read configured token information")?;
+        let matches = |configured: &Option<String>, padded: &[u8]| {
+            let end = padded.iter().rposition(|b| *b != b' ').map_or(0, |i| i + 1);
+            configured
+                .as_ref()
+                .is_none_or(|s| s.as_bytes() == &padded[..end])
+        };
+        if !matches(&selection.token_label, &info.label)
+            || !matches(&selection.token_serial, &info.serial)
+        {
+            continue;
+        }
+        let candidate = search_slot_filtered(
+            &module,
+            slot,
+            selection.subject_cn.as_deref(),
+            selection.object_label.as_deref(),
+            selection.object_id.as_deref(),
+        )?;
+        let Some(candidate) = candidate else {
+            continue;
+        };
+        if selected.is_some() {
+            bail!("Configured PKCS#11 selection matches multiple tokens");
+        }
+        selected = Some(candidate);
+    }
+    let candidate = selected.context("Configured PKCS#11 identity was not found")?;
+    // SAFETY: geteuid has no preconditions and does not access caller memory.
+    let owner = unsafe { libc::geteuid() };
+    #[cfg(feature = "e2e-fault-injection")]
+    candidate.session.set_role_sign_marker(selection.pin_file.with_extension("p5-sign-inflight"));
+    select_identity_for_owner(candidate, &selection.pin_file, owner)
+        .map_err(anyhow::Error::new)?
+        .context("Configured token has no usable signing identity")
 }
 
 fn identity_on(
@@ -90,11 +167,19 @@ fn identity_on(
 
 /// Unlocks the candidate's token and selects the certificate it presents for mutual TLS.
 fn select_identity(candidate: Candidate, pin_file: &Path) -> Result<Option<Identity>, Error> {
+    select_identity_for_owner(candidate, pin_file, 0)
+}
+
+fn select_identity_for_owner(
+    candidate: Candidate,
+    pin_file: &Path,
+    owner: u32,
+) -> Result<Option<Identity>, Error> {
     let Token {
         session,
         objects,
         mut certificates,
-    } = unlock_token(candidate, pin_file).map_err(Error::identity_unavailable)?;
+    } = unlock_token_for_owner(candidate, pin_file, owner).map_err(Error::identity_unavailable)?;
 
     let Some(index) = selected_certificate(&certificates) else {
         return Ok(None);
@@ -498,7 +583,7 @@ fn find_token(p11_kit: &Path, module: &Path, subject_cn: &str) -> Result<Option<
 }
 
 /// Unlocks the candidate's token and pairs each matching certificate with its private key.
-fn unlock_token(candidate: Candidate, pin_file: &Path) -> Result<Token> {
+fn unlock_token_for_owner(candidate: Candidate, pin_file: &Path, owner: u32) -> Result<Token> {
     let Candidate {
         flags,
         session,
@@ -506,7 +591,7 @@ fn unlock_token(candidate: Candidate, pin_file: &Path) -> Result<Token> {
         matches,
     } = candidate;
 
-    unlock(&session, flags, pin_file)?;
+    unlock_for_owner(&session, flags, pin_file, owner)?;
 
     let certificates = matches
         .into_iter()
@@ -531,6 +616,16 @@ struct Candidate {
 
 /// Reads the certificates on `slot`, before any login, to see whether the token is one of ours.
 fn search_slot(pkcs11: &rpc::Module, slot: u64, subject_cn: &str) -> Result<Option<Candidate>> {
+    search_slot_filtered(pkcs11, slot, Some(subject_cn), None, None)
+}
+
+fn search_slot_filtered(
+    pkcs11: &rpc::Module,
+    slot: u64,
+    subject_cn: Option<&str>,
+    object_label: Option<&str>,
+    object_id: Option<&[u8]>,
+) -> Result<Option<Candidate>> {
     let flags = pkcs11
         .token_flags(slot)
         .context("Failed to read the token information")?;
@@ -553,7 +648,10 @@ fn search_slot(pkcs11: &rpc::Module, slot: u64, subject_cn: &str) -> Result<Opti
                 return None;
             };
 
-            (metadata.subject_cn.as_deref() == Some(subject_cn)).then_some((index, metadata))
+            (subject_cn.is_none_or(|cn| metadata.subject_cn.as_deref() == Some(cn))
+                && object_label.is_none_or(|label| object.label.as_deref() == Some(label))
+                && object_id.is_none_or(|id| object.id.as_deref() == Some(id)))
+            .then_some((index, metadata))
         })
         .collect::<Vec<_>>();
 
@@ -570,13 +668,22 @@ fn search_slot(pkcs11: &rpc::Module, slot: u64, subject_cn: &str) -> Result<Opti
 }
 
 /// Unlocks the token, if it asks to be, with the PIN Firezone keeps on disk.
-fn unlock(session: &rpc::Session, flags: LoginFlags, pin_file: &Path) -> Result<()> {
+fn unlock_for_owner(
+    session: &rpc::Session,
+    flags: LoginFlags,
+    pin_file: &Path,
+    owner: u32,
+) -> Result<()> {
     match login_requirement(flags)? {
         Login::NotRequired => {
             tracing::debug!("The PKCS#11 token hands out its keys without a login");
         }
         Login::Pin => {
-            let pin = read_pin(pin_file)?;
+            let pin = if owner == 0 {
+                read_pin(pin_file)?
+            } else {
+                read_pin_for_owner(pin_file, owner)?
+            };
 
             log_in(session, &pin).with_context(|| rejected_pin_reason(flags))?;
         }
@@ -684,20 +791,37 @@ fn log_in(session: &rpc::Session, pin: &SecretString) -> Result<()> {
 ///
 /// Returns an error if the file is missing or unreadable, or if it is not root's alone.
 fn read_pin(path: &Path) -> Result<SecretString> {
-    let mut file = File::open(path)
+    read_pin_for_owner(path, 0)
+}
+
+fn read_pin_for_owner(path: &Path, owner: u32) -> Result<SecretString> {
+    let file = File::open(path)
         .with_context(|| format!("Failed to open the PKCS#11 PIN file '{}'", path.display()))?;
     let metadata = file
         .metadata()
         .with_context(|| format!("Failed to read the metadata of '{}'", path.display()))?;
 
-    ensure_root_only(metadata.mode(), metadata.uid(), path)?;
+    if owner == 0 {
+        ensure_root_only(metadata.mode(), metadata.uid(), path)?;
+    } else if metadata.mode() & 0o077 != 0 || metadata.uid() != owner {
+        bail!("Configured PIN file must be private to the service account");
+    }
+    if !metadata.is_file() || metadata.len() > 4096 {
+        bail!("Configured PIN source must be a bounded regular file");
+    }
 
     let mut contents = String::new();
-    file.read_to_string(&mut contents)
+    file.take(4097)
+        .read_to_string(&mut contents)
         .with_context(|| format!("Failed to read '{}'", path.display()))?;
 
-    // A PIN may deliberately begin or end with a space, so only the line ending is stripped.
-    Ok(SecretString::from(contents.trim_end_matches(['\n', '\r'])))
+    if contents.len() > 4096 {
+        bail!("Configured PIN file exceeds the size limit");
+    }
+    // Keep leading/trailing spaces; move the allocation into SecretString.
+    let length = contents.trim_end_matches(['\n', '\r']).len();
+    contents.truncate(length);
+    Ok(SecretString::from(contents))
 }
 
 /// Refuses a PIN file that any account other than root can get at.

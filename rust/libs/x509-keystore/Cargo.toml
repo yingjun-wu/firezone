@@ -5,6 +5,10 @@ edition = { workspace = true }
 authors = ["Firezone, Inc."]
 license = { workspace = true }
 
+[features]
+# Task-only IPC failure injection; never enabled by product builds.
+e2e-fault-injection = []
+
 [dependencies]
 anyhow = { workspace = true }
 rustls = { workspace = true }
@@ -13,6 +17,7 @@ x509-claims = { workspace = true }
 x509-credential = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
 secrecy = { workspace = true }
 sha2 = { workspace = true }
 tracing = { workspace = true }
@@ -27,6 +32,7 @@ windows = { workspace = true, features = [
 windows-core = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
+serde_json = { workspace = true }
 cryptoki = { workspace = true }
 ring = { workspace = true }
 x509-parser = { workspace = true }

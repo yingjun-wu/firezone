@@ -201,6 +201,15 @@ pub struct ClientState {
 }
 
 impl ClientState {
+    pub fn poll_connection_observation(
+        &mut self,
+    ) -> Option<snownet::ConnectionObservation<ClientOrGatewayId>> {
+        self.node.poll_connection_observation()
+    }
+    pub fn dropped_connection_observations(&self) -> u64 {
+        self.node.dropped_connection_observations()
+    }
+
     pub fn new(
         seed: [u8; 32],
         records: BTreeSet<DnsResourceRecord>,

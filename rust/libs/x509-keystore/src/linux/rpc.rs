@@ -14,6 +14,12 @@ use std::{
     sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
+pub(crate) struct TokenInfo {
+    pub label: Vec<u8>,
+    pub serial: Vec<u8>,
+    pub flags: u64,
+}
+
 /// `CKO_CERTIFICATE`, the class of certificate objects.
 pub(crate) const OBJECT_CLASS_CERTIFICATE: u64 = 0x0000_0001;
 /// `CKO_PRIVATE_KEY`, the class of private-key objects.
@@ -163,6 +169,10 @@ impl Module {
             stdin,
             stdout,
             next_code: FIRST_MESSAGE_CODE,
+            #[cfg(any(test, feature = "e2e-fault-injection"))]
+            interrupt_sign_response: None,
+            #[cfg(feature = "e2e-fault-injection")]
+            role_sign_marker: None,
         };
 
         let protocol_version = match negotiate_and_initialize(&mut transport) {
@@ -208,18 +218,23 @@ impl Module {
 
     /// Returns the `CK_TOKEN_INFO.flags` of the token in `slot`.
     pub(crate) fn token_flags(&self, slot: u64) -> Result<u64, Error> {
+        Ok(self.token_info(slot)?.flags)
+    }
+
+    pub(crate) fn token_info(&self, slot: u64) -> Result<TokenInfo, Error> {
         let mut request = Request::new(&GET_TOKEN_INFO);
         request.ulong(slot);
         let mut response = self.connection.call(&GET_TOKEN_INFO, request)?;
-
-        // The label, manufacturer, model and serial number precede the flags.
-        response.space_string(32)?;
+        let label = response.space_bytes(32)?;
         response.space_string(32)?;
         response.space_string(16)?;
-        response.space_string(16)?;
+        let serial = response.space_bytes(16)?;
         let flags = response.ulong()?;
-
-        Ok(flags)
+        Ok(TokenInfo {
+            label,
+            serial,
+            flags,
+        })
     }
 
     /// Opens a read-only session on the token in `slot`.
@@ -251,6 +266,35 @@ pub(crate) struct Session {
 }
 
 impl Session {
+    /// The test role arms only its task-owned PIN selector's adjacent marker.
+    #[cfg(feature = "e2e-fault-injection")]
+    pub(crate) fn set_role_sign_marker(&self, marker: std::path::PathBuf) {
+        self.connection.lock().role_sign_marker = Some(marker);
+    }
+    /// Fault injection for the task-owned broker; never compiled into products.
+    #[cfg(test)]
+    pub(crate) fn stop_broker_for_test(&self) -> impl FnOnce() -> std::io::Result<()> + use<> {
+        let connection = Arc::clone(&self.connection);
+        move || {
+            let mut transport = connection.lock();
+            transport.child.kill()?;
+            transport.child.wait()?;
+            Ok(())
+        }
+    }
+
+    /// Arm after identity selection: interrupt only an initialized SIGN request.
+    /// This fault applies solely to the child broker owned by this test session.
+    #[cfg(test)]
+    pub(crate) fn interrupt_next_sign_for_test(
+        &self,
+    ) -> (impl FnOnce() + use<>, Arc<std::sync::atomic::AtomicBool>) {
+        let connection = Arc::clone(&self.connection);
+        let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let witness = Arc::clone(&observed);
+        (move || { connection.lock().interrupt_sign_response = Some(witness); }, observed)
+    }
+
     /// Logs the token's user in with `pin`.
     pub(crate) fn login_user(&self, pin: &[u8]) -> Result<(), Error> {
         /// `CKU_USER`, the ordinary user of a token.
@@ -429,7 +473,12 @@ impl Session {
         init.ulong(self.handle);
         init.mechanism(mechanism, self.connection.protocol_version);
         init.ulong(key);
-        call(&mut transport, &SIGN_INIT, init)?;
+        let initialized = call(&mut transport, &SIGN_INIT, init);
+        if matches!(&initialized, Err(Error::Token(ReturnValue(CKR_KEY_FUNCTION_NOT_PERMITTED)))) {
+            // No token identity, data, PIN or driver text enters diagnostics.
+            tracing::debug!("PKCS#11 signing initialization refused by token");
+        }
+        initialized?;
 
         let mut request = Request::new(&SIGN);
         request.ulong(self.handle);
@@ -679,6 +728,10 @@ struct Transport {
     stdin: ChildStdin,
     stdout: ChildStdout,
     next_code: u32,
+    #[cfg(any(test, feature = "e2e-fault-injection"))]
+    interrupt_sign_response: Option<Arc<std::sync::atomic::AtomicBool>>,
+    #[cfg(feature = "e2e-fault-injection")]
+    role_sign_marker: Option<std::path::PathBuf>,
 }
 
 impl Transport {
@@ -690,6 +743,23 @@ impl Transport {
     fn roundtrip(&mut self, request: &[u8]) -> Result<Vec<u8>, Error> {
         let code = self.next_code;
         self.next_code = self.next_code.wrapping_add(1);
+
+        #[cfg(feature = "e2e-fault-injection")]
+        if request.get(..4) == Some(SIGN.id.to_be_bytes().as_slice()) {
+            if let Some(marker) = &self.role_sign_marker {
+                match std::fs::remove_file(marker) {
+                    Ok(()) => self.interrupt_sign_response = Some(Arc::new(std::sync::atomic::AtomicBool::new(false))),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                    Err(error) => return Err(Error::Transport(error)),
+                }
+            }
+        }
+        #[cfg(any(test, feature = "e2e-fault-injection"))]
+        if request.get(..4) == Some(SIGN.id.to_be_bytes().as_slice()) {
+            if let Some(witness) = self.interrupt_sign_response.take() {
+                return self.interrupt_inflight_sign_for_test(code, request, witness);
+            }
+        }
 
         let mut header = [0u8; 12];
         header[0..4].copy_from_slice(&code.to_be_bytes());
@@ -726,6 +796,52 @@ impl Transport {
             .map_err(Error::Transport)?;
 
         Ok(payload)
+    }
+
+    /// Queue a real SIGN frame after successful SIGN_INIT, then remove its
+    /// broker before any response can be consumed. This is an IPC failure,
+    /// not evidence of interruption inside a hardware signing operation.
+    #[cfg(any(test, feature = "e2e-fault-injection"))]
+    fn interrupt_inflight_sign_for_test(
+        &mut self, code: u32, request: &[u8], witness: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<Vec<u8>, Error> {
+        let sent = (|| {
+            let pid = self.child.id() as libc::pid_t;
+            // SAFETY: this PID belongs to our live child and no pointer is used.
+            if unsafe { libc::kill(pid, libc::SIGSTOP) } != 0 {
+                return Err(Error::Transport(std::io::Error::last_os_error()));
+            }
+            let mut status = 0;
+            loop {
+                // SAFETY: status points to writable storage; wait only our child.
+                let result = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) };
+                if result == pid && libc::WIFSTOPPED(status) { break; }
+                let error = std::io::Error::last_os_error();
+                if result == -1 && error.kind() == std::io::ErrorKind::Interrupted { continue; }
+                return Err(Error::Protocol("task broker did not enter stopped state".into()));
+            }
+            let mut header = [0u8; 12];
+            header[0..4].copy_from_slice(&code.to_be_bytes());
+            header[8..12].copy_from_slice(&(request.len() as u32).to_be_bytes());
+            self.stdin.write_all(&header).map_err(Error::Transport)?;
+            self.stdin.write_all(request).map_err(Error::Transport)?;
+            self.stdin.flush().map_err(Error::Transport)?;
+            Ok::<_, Error>(())
+        })();
+        // Always reap the owned child, including a failed request write.
+        let killed = self.child.kill();
+        let reaped = self.child.wait();
+        sent?;
+        killed.map_err(Error::Transport)?;
+        reaped.map_err(Error::Transport)?;
+        let mut response = [0u8; 12];
+        let failure = self.stdout.read_exact(&mut response).err()
+            .ok_or_else(|| Error::Protocol("stopped task broker unexpectedly answered SIGN".into()))?;
+        if failure.kind() == std::io::ErrorKind::UnexpectedEof {
+            witness.store(true, std::sync::atomic::Ordering::SeqCst);
+            tracing::warn!("PKCS#11 task broker interrupted after initialized SIGN request");
+        }
+        Err(Error::Transport(failure))
     }
 
     /// Ends a connection that never became usable, naming what the child said on stderr.
@@ -942,15 +1058,17 @@ impl Response {
 
     /// Reads an `s` value, which must be exactly `length` bytes of padded text.
     fn space_string(&mut self, length: usize) -> Result<(), Error> {
+        self.space_bytes(length).map(|_| ())
+    }
+
+    fn space_bytes(&mut self, length: usize) -> Result<Vec<u8>, Error> {
         let carried = self.u32()?;
         if carried as usize != length {
             return Err(Error::Protocol(format!(
                 "The response carries a string of {carried} bytes where {length} were awaited"
             )));
         }
-        self.take(length)?;
-
-        Ok(())
+        Ok(self.take(length)?.to_vec())
     }
 
     /// Reads an `ay` value.

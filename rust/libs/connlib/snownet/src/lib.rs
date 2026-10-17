@@ -3,6 +3,9 @@
 #![cfg_attr(test, allow(clippy::unwrap_in_result))]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
+mod connection_observation;
+pub use connection_observation::{ConnectionObservation, ConnectionStage};
+
 mod agent;
 mod allocation;
 mod backoff;

@@ -452,7 +452,8 @@ fn strips_only_the_line_ending_of_a_pin() {
     let path = directory.join("pin");
     write_pin_file(&path, " space \r\n");
 
-    let pin = read_pin(&path).expect("the PIN file should be readable");
+    // Match this fixture file owner without changing the production root-only path.
+    let pin = read_pin_for_owner(&path, unsafe { libc::geteuid() }).expect("the PIN file should be readable");
 
     assert_eq!(pin.expose_secret(), " space ");
 
@@ -670,6 +671,14 @@ fn write_pin_file(path: &Path, pin: &str) {
 /// A missing module fails the test rather than skipping it: a skipped test reports coverage the run
 /// does not have.
 fn softhsm_module() -> PathBuf {
+    if let Some(path) = std::env::var_os("EDGEWALL_SOFTHSM_MODULE") {
+        let path = PathBuf::from(path);
+        assert!(
+            path.is_absolute() && path.is_file(),
+            "task-local module must exist"
+        );
+        return path;
+    }
     const CANDIDATES: [&str; 2] = [
         "/usr/lib/softhsm/libsofthsm2.so",
         "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so",
@@ -800,6 +809,8 @@ fn generate_key_pair(
     let private_template = vec![
         Attribute::Token(true),
         Attribute::Private(true),
+        Attribute::Sensitive(true),
+        Attribute::Extractable(false),
         Attribute::Sign(true),
         Attribute::Label(label.as_bytes().to_vec()),
         Attribute::Id(id.to_vec()),
@@ -922,6 +933,15 @@ fn self_signed_certificate(
     public_key: &PublicKey,
     sign: impl FnOnce(&[u8]) -> Vec<u8>,
 ) -> Vec<u8> {
+    self_signed_certificate_at(subject_cn, public_key, NOT_BEFORE, sign)
+}
+
+fn self_signed_certificate_at(
+    subject_cn: &str,
+    public_key: &PublicKey,
+    not_before: &[u8],
+    sign: impl FnOnce(&[u8]) -> Vec<u8>,
+) -> Vec<u8> {
     let algorithm = signature_algorithm(public_key);
     let name = distinguished_name(subject_cn);
     let tbs_certificate = sequence(&[
@@ -929,7 +949,7 @@ fn self_signed_certificate(
         &der(0x02, &[1]),             // Serial number.
         &algorithm,
         &name,
-        &sequence(&[&der(0x17, NOT_BEFORE), &der(0x17, NOT_AFTER)]),
+        &sequence(&[&der(0x17, not_before), &der(0x17, NOT_AFTER)]),
         &name,
         &subject_public_key_info(public_key),
         &der(0xa3, &sequence(&[&key_usage(), &extended_key_usage()])),
@@ -1014,4 +1034,395 @@ fn bit_string(contents: &[u8]) -> Vec<u8> {
     body.extend_from_slice(contents);
 
     der(0x03, &body)
+}
+
+fn configured_selection(token: &Token) -> crate::Pkcs11Selection {
+    crate::Pkcs11Selection {
+        module: token.module.clone(),
+        pin_file: token.pin_file.clone(),
+        token_label: Some(
+            token
+                .directory
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        token_serial: None,
+        object_label: None,
+        object_id: Some(vec![1]),
+        subject_cn: Some(token.subject_cn.clone()),
+    }
+}
+
+#[test]
+#[ignore = "requires task-local SoftHSM and p11-kit"]
+fn configured_pkcs11_selects_nonexportable_rsa_and_ecdsa_keys_and_reconnects() {
+    let _serialized = serialize_token_access();
+    for (name, algorithm) in [
+        ("cfg-rsa", KeyAlgorithm::Rsa),
+        ("cfg-ec", KeyAlgorithm::EcdsaP256),
+    ] {
+        let token = provision_token(name, algorithm);
+        let mut selection = configured_selection(&token);
+        selection.object_label = selection.token_label.clone();
+        // Read public token metadata using the same existing RPC implementation.
+        let module = rpc::Module::load(&token.p11_kit, &token.module).unwrap();
+        for slot in module.slots_with_tokens().unwrap() {
+            let info = module.token_info(slot).unwrap();
+            let label = String::from_utf8(info.label).unwrap();
+            if Some(label.trim_end()) == selection.token_label.as_deref() {
+                selection.token_serial = Some(
+                    String::from_utf8(info.serial)
+                        .unwrap()
+                        .trim_end()
+                        .to_owned(),
+                );
+            }
+        }
+        assert!(selection.token_serial.is_some());
+        drop(module);
+        let identity = crate::identity_with_pkcs11(&selection).unwrap();
+        assert_eq!(leaf_of(&identity), token.certificate);
+        assert_signs_every_advertised_scheme(&identity, &token.certificate);
+        // A fresh load owns a new session, with the same token-held key.
+        drop(identity);
+        let reconnected = crate::identity_with_pkcs11(&selection).unwrap();
+        assert_signs_every_advertised_scheme(&reconnected, &token.certificate);
+    }
+}
+
+#[test]
+#[ignore = "requires task-local SoftHSM and p11-kit"]
+fn configured_pkcs11_rejects_wrong_selectors_pin_and_unsafe_pin_files() {
+    let _serialized = serialize_token_access();
+    let token = provision_token("cfg-deny", KeyAlgorithm::EcdsaP256);
+    let selection = configured_selection(&token);
+    for boundary in ["token", "serial", "object_id", "object_label", "subject"] {
+        let mut wrong = selection.clone();
+        match boundary {
+            "token" => wrong.token_label = Some("missing".into()),
+            "serial" => wrong.token_serial = Some("missing".into()),
+            "object_id" => wrong.object_id = Some(vec![2]),
+            "object_label" => wrong.object_label = Some("missing".into()),
+            "subject" => wrong.subject_cn = Some("different.example".into()),
+            _ => unreachable!(),
+        }
+        assert!(crate::identity_with_pkcs11(&wrong).is_err(), "{boundary}");
+    }
+    let wrong_pin = "incorrect-fixture-pin";
+    write_pin_file(&token.pin_file, wrong_pin);
+    let error = crate::identity_with_pkcs11(&selection)
+        .err()
+        .expect("wrong PIN must fail");
+    assert!(!error.to_string().contains(wrong_pin));
+    write_pin_file(&token.pin_file, PIN);
+    fs::set_permissions(&token.pin_file, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(crate::identity_with_pkcs11(&selection).is_err());
+    fs::set_permissions(&token.pin_file, fs::Permissions::from_mode(0o600)).unwrap();
+    let identity = crate::identity_with_pkcs11(&selection).unwrap();
+    assert_signs_every_advertised_scheme(&identity, &token.certificate);
+}
+
+#[test]
+#[ignore = "requires task-local SoftHSM and p11-kit"]
+fn configured_pkcs11_reload_selects_a_rotated_certificate() {
+    let _serialized = serialize_token_access();
+    let token = provision_token("cfg-rotate", KeyAlgorithm::EcdsaP256);
+    let selection = configured_selection(&token);
+    let old = crate::identity_with_pkcs11(&selection).unwrap();
+    assert_eq!(leaf_of(&old), token.certificate);
+    drop(old);
+    let pkcs11 = Pkcs11::new(&token.module).unwrap();
+    pkcs11
+        .initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK))
+        .unwrap();
+    let slot = slot_of(&pkcs11, selection.token_label.as_deref().unwrap());
+    let session = pkcs11.open_rw_session(slot).unwrap();
+    session
+        .login(UserType::User, Some(&AuthPin::new(PIN.into())))
+        .unwrap();
+    let private = session
+        .find_objects(&[
+            Attribute::Class(ObjectClass::PRIVATE_KEY),
+            Attribute::Id(vec![1]),
+        ])
+        .unwrap()[0];
+    let public = session
+        .find_objects(&[
+            Attribute::Class(ObjectClass::PUBLIC_KEY),
+            Attribute::Id(vec![1]),
+        ])
+        .unwrap()[0];
+    assert_eq!(
+        session
+            .get_attributes(private, &[AttributeType::Extractable])
+            .unwrap(),
+        vec![Attribute::Extractable(false)]
+    );
+    let public = read_public_key(&session, public, KeyAlgorithm::EcdsaP256);
+    let rotated = self_signed_certificate_at(&token.subject_cn, &public, b"210101000000Z", |tbs| {
+        sign_certificate(&session, private, KeyAlgorithm::EcdsaP256, tbs)
+    });
+    session
+        .create_object(&[
+            Attribute::Class(ObjectClass::CERTIFICATE),
+            Attribute::CertificateType(CertificateType::X_509),
+            Attribute::Token(true),
+            Attribute::Label(selection.token_label.as_ref().unwrap().as_bytes().to_vec()),
+            Attribute::Id(vec![1]),
+            Attribute::Subject(distinguished_name(&token.subject_cn)),
+            Attribute::Value(rotated.clone()),
+        ])
+        .unwrap();
+    drop(session);
+    drop(pkcs11);
+    let renewed = crate::identity_with_pkcs11(&selection).unwrap();
+    assert_ne!(leaf_of(&renewed), token.certificate);
+    assert_eq!(leaf_of(&renewed), rotated);
+    assert_signs_every_advertised_scheme(&renewed, &rotated);
+}
+
+#[test]
+#[ignore = "requires task-local SoftHSM and p11-kit"]
+fn configured_pkcs11_broker_loss_is_a_signing_error_and_fresh_session_recovers() {
+    let _serialized = serialize_token_access();
+    let token = provision_token("cfg-broker", KeyAlgorithm::EcdsaP256);
+    let candidate = find_token(&token.p11_kit, &token.module, &token.subject_cn)
+        .unwrap()
+        .unwrap();
+    let stop = candidate.session.stop_broker_for_test();
+    // SAFETY: geteuid has no preconditions.
+    let identity =
+        select_identity_for_owner(candidate, &token.pin_file, unsafe { libc::geteuid() })
+            .unwrap()
+            .unwrap();
+    assert_signs_every_advertised_scheme(&identity, &token.certificate);
+    stop().unwrap();
+    assert!(matches!(
+        identity
+            .key
+            .sign(SignatureScheme::ECDSA_NISTP256_SHA256, MESSAGE),
+        Err(SigningError::Keystore(_))
+    ));
+    drop(identity);
+    let recovered = crate::identity_with_pkcs11(&configured_selection(&token)).unwrap();
+    assert_signs_every_advertised_scheme(&recovered, &token.certificate);
+}
+
+/// Test-host fixture operations, never product enrollment APIs.
+#[test]
+#[ignore = "task-owned software token preparation only"]
+fn prepare_software_token_network_fixture() {
+    let _serialized = serialize_token_access();
+    let output = PathBuf::from(
+        std::env::var_os("EDGEWALL_PKCS11_FIXTURE_DIR").expect("task fixture output"),
+    );
+    assert!(output.is_absolute() && output.starts_with(std::env::temp_dir()));
+    fs::create_dir(&output).unwrap();
+    fs::set_permissions(&output, fs::Permissions::from_mode(0o700)).unwrap();
+    let token = provision_token("cfg-tls", KeyAlgorithm::EcdsaP256);
+    fs::set_permissions(&token.directory, fs::Permissions::from_mode(0o700)).unwrap();
+    let selection = configured_selection(&token);
+    fs::write(
+        output.join("selection.json"),
+        serde_json::to_vec(&selection).unwrap(),
+    )
+    .unwrap();
+    fs::write(output.join("public.der"), &token.certificate).unwrap();
+    fs::write(
+        output.join("token-directory"),
+        token.directory.to_string_lossy().as_bytes(),
+    )
+    .unwrap();
+    fs::set_permissions(
+        output.join("selection.json"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    // The task's network fixture owns this store until explicit task cleanup.
+    std::mem::forget(token);
+}
+
+#[test]
+#[ignore = "task-owned public-certificate enrollment only"]
+fn enroll_software_token_network_fixture_certificate() {
+    let _serialized = serialize_token_access();
+    let output = PathBuf::from(
+        std::env::var_os("EDGEWALL_PKCS11_FIXTURE_DIR").expect("task fixture output"),
+    );
+    assert!(output.is_absolute() && output.starts_with(std::env::temp_dir()));
+    let selection: crate::Pkcs11Selection =
+        serde_json::from_slice(&fs::read(output.join("selection.json")).unwrap()).unwrap();
+    assert_eq!(selection.module, softhsm_module());
+    assert!(
+        selection
+            .token_label
+            .as_ref()
+            .unwrap()
+            .starts_with("keystore-")
+    );
+    let token_dir = PathBuf::from(fs::read_to_string(output.join("token-directory")).unwrap());
+    assert!(token_dir.starts_with(std::env::temp_dir()));
+    // SAFETY: this helper holds the same token serialization lock as provisioning.
+    unsafe {
+        std::env::set_var("SOFTHSM2_CONF", token_dir.join("softhsm2.conf"));
+    }
+    let leaf = fs::read(output.join("issued-leaf.der")).unwrap();
+    let root = fs::read(output.join("issuer.der")).unwrap();
+    let original = fs::read(output.join("public.der")).unwrap();
+    let parsed = X509Certificate::from_der(&leaf).unwrap().1;
+    assert_eq!(
+        parsed.public_key().raw,
+        X509Certificate::from_der(&original)
+            .unwrap()
+            .1
+            .public_key()
+            .raw
+    );
+    let pkcs11 = Pkcs11::new(&selection.module).unwrap();
+    pkcs11
+        .initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK))
+        .unwrap();
+    let slot = slot_of(&pkcs11, selection.token_label.as_deref().unwrap());
+    let session = pkcs11.open_rw_session(slot).unwrap();
+    session
+        .login(UserType::User, Some(&AuthPin::new(PIN.into())))
+        .unwrap();
+    for old in session
+        .find_objects(&[
+            Attribute::Class(ObjectClass::CERTIFICATE),
+            Attribute::Id(vec![1]),
+        ])
+        .unwrap()
+    {
+        session.destroy_object(old).unwrap();
+    }
+    for (id, certificate) in [(1, leaf), (2, root)] {
+        let parsed = X509Certificate::from_der(&certificate).unwrap().1;
+        session
+            .create_object(&[
+                Attribute::Class(ObjectClass::CERTIFICATE),
+                Attribute::CertificateType(CertificateType::X_509),
+                Attribute::Token(true),
+                Attribute::Id(vec![id]),
+                Attribute::Label(selection.token_label.as_ref().unwrap().as_bytes().to_vec()),
+                Attribute::Subject(parsed.subject().as_raw().to_vec()),
+                Attribute::Value(certificate),
+            ])
+            .unwrap();
+    }
+}
+
+/// Task-only key policy injection; signing still uses the real token/backend.
+#[test]
+#[ignore = "task-owned software-token signing fault only"]
+fn switch_software_token_network_fixture_signing() {
+    let _serialized = serialize_token_access();
+    let fixture = PathBuf::from(std::env::var_os("EDGEWALL_PKCS11_FIXTURE_DIR").unwrap()).canonicalize().unwrap();
+    assert!(fixture.starts_with(std::env::temp_dir()));
+    let selection: crate::Pkcs11Selection = serde_json::from_slice(&fs::read(fixture.join("selection.json")).unwrap()).unwrap();
+    assert_eq!(selection.module, softhsm_module());
+    let directory = PathBuf::from(fs::read_to_string(fixture.join("token-directory")).unwrap()).canonicalize().unwrap();
+    assert!(directory.starts_with(std::env::temp_dir()));
+    assert_eq!(PathBuf::from(std::env::var_os("SOFTHSM2_CONF").unwrap()).canonicalize().unwrap(), directory.join("softhsm2.conf"));
+    let enabled = match std::env::var("EDGEWALL_PKCS11_FIXTURE_SIGNING").unwrap().as_str() {
+        "enabled" => true,
+        "disabled" => false,
+        _ => panic!("explicit task signing state required"),
+    };
+    let pkcs11 = Pkcs11::new(&selection.module).unwrap();
+    pkcs11.initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK)).unwrap();
+    let slot = slot_of(&pkcs11, selection.token_label.as_deref().unwrap());
+    let session = pkcs11.open_rw_session(slot).unwrap();
+    let pin = fs::read_to_string(&selection.pin_file).unwrap();
+    session.login(UserType::User, Some(&AuthPin::new(pin.trim().to_owned().into()))).unwrap();
+    let keys = session.find_objects(&[
+        Attribute::Class(ObjectClass::PRIVATE_KEY),
+        Attribute::Id(selection.object_id.clone().expect("fixture key id")),
+    ]).unwrap();
+    assert_eq!(keys.len(), 1);
+    session.update_attributes(keys[0], &[Attribute::Sign(enabled)]).unwrap();
+    assert_eq!(session.get_attributes(keys[0], &[AttributeType::Sign]).unwrap(), vec![Attribute::Sign(enabled)]);
+    drop(session);
+    // A selectable identity is the positive control: the subsequent role must
+    // fail in its handshake signature, not in certificate/key discovery.
+    let identity = crate::identity_with_pkcs11(&selection).unwrap();
+    let result = identity.key.sign(SignatureScheme::ECDSA_NISTP256_SHA256, b"task signing policy probe");
+    if enabled { assert!(result.is_ok()); }
+    else { assert!(matches!(result, Err(SigningError::AccessDenied(_)))); }
+    fs::write(fixture.join(if enabled {"signing-enabled.json"} else {"signing-disabled.json"}),
+        serde_json::to_vec(&serde_json::json!({"status":"PASS","sign_enabled":enabled,
+            "identity_selectable":true,"actual_token_sign_probe":true})).unwrap()).unwrap();
+}
+
+/// Real token initialization and queued IPC; not hardware-internal interruption.
+#[test]
+#[ignore = "requires task-local SoftHSM and p11-kit"]
+fn configured_pkcs11_inflight_sign_broker_loss_preserves_error_and_recovers() {
+    let _serialized = serialize_token_access();
+    let token = provision_token("cfg-inflight", KeyAlgorithm::EcdsaP256);
+    let candidate = find_token(&token.p11_kit, &token.module, &token.subject_cn)
+        .unwrap().unwrap();
+    let (arm, observed) = candidate.session.interrupt_next_sign_for_test();
+    // SAFETY: geteuid has no preconditions.
+    let identity = select_identity_for_owner(candidate, &token.pin_file, unsafe { libc::geteuid() })
+        .unwrap().unwrap();
+    assert_signs_every_advertised_scheme(&identity, &token.certificate);
+    arm();
+    assert!(matches!(identity.key.sign(SignatureScheme::ECDSA_NISTP256_SHA256, MESSAGE),
+        Err(SigningError::Keystore(_))));
+    assert!(observed.load(std::sync::atomic::Ordering::SeqCst),
+        "SIGN must reach the pipe only after successful SIGN_INIT");
+    assert!(matches!(identity.key.sign(SignatureScheme::ECDSA_NISTP256_SHA256, MESSAGE),
+        Err(SigningError::Keystore(_))));
+    drop(identity);
+    let recovered = crate::identity_with_pkcs11(&configured_selection(&token)).unwrap();
+    assert_signs_every_advertised_scheme(&recovered, &token.certificate);
+}
+
+/// Destructive only to the selected task-owned SoftHSM fixture, never hardware.
+#[test]
+#[ignore = "task-owned certificate-only token fault"]
+fn remove_private_key_network_fixture() {
+    let _serialized = serialize_token_access();
+    let fixture = PathBuf::from(std::env::var_os("EDGEWALL_PKCS11_FIXTURE_DIR").unwrap()).canonicalize().unwrap();
+    assert!(fixture.starts_with(std::env::temp_dir()));
+    let selection: crate::Pkcs11Selection = serde_json::from_slice(&fs::read(fixture.join("selection.json")).unwrap()).unwrap();
+    assert_eq!(selection.module, softhsm_module());
+    assert_eq!(selection.module.file_name().unwrap(), "libsofthsm2.so");
+    assert!(selection.token_label.as_deref().unwrap().starts_with("keystore-") && selection.token_label.as_deref().unwrap().ends_with("-cfg-tls"));
+    let directory = PathBuf::from(fs::read_to_string(fixture.join("token-directory")).unwrap()).canonicalize().unwrap();
+    assert!(directory.starts_with(fixture.parent().unwrap()));
+    assert_eq!(PathBuf::from(std::env::var_os("SOFTHSM2_CONF").unwrap()).canonicalize().unwrap(), directory.join("softhsm2.conf"));
+    let certificate = fs::read(fixture.join("issued-leaf.der")).unwrap();
+    let identity = crate::identity_with_pkcs11(&selection).unwrap();
+    assert_eq!(leaf_of(&identity), certificate);
+    assert_signs_every_advertised_scheme(&identity, &certificate);
+    drop(identity);
+    let pkcs11 = Pkcs11::new(&selection.module).unwrap();
+    pkcs11.initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK)).unwrap();
+    let slot = slot_of(&pkcs11, selection.token_label.as_deref().unwrap());
+    assert!(pkcs11.get_token_info(slot).unwrap().manufacturer_id().contains("SoftHSM"));
+    let session = pkcs11.open_rw_session(slot).unwrap();
+    let pin = fs::read_to_string(&selection.pin_file).unwrap();
+    session.login(UserType::User, Some(&AuthPin::new(pin.trim().to_owned().into()))).unwrap();
+    let id = selection.object_id.clone().unwrap();
+    let certificates = session.find_objects(&[Attribute::Class(ObjectClass::CERTIFICATE),Attribute::Id(id.clone())]).unwrap();
+    assert_eq!(certificates.len(), 1);
+    assert_eq!(session.get_attributes(certificates[0], &[AttributeType::Value]).unwrap(), vec![Attribute::Value(certificate.clone())]);
+    let keys = session.find_objects(&[Attribute::Class(ObjectClass::PRIVATE_KEY),Attribute::Id(id.clone())]).unwrap();
+    assert_eq!(keys.len(), 1);
+    session.destroy_object(keys[0]).unwrap();
+    assert!(session.find_objects(&[Attribute::Class(ObjectClass::PRIVATE_KEY),Attribute::Id(id)]).unwrap().is_empty());
+    assert_eq!(session.get_attributes(certificates[0], &[AttributeType::Value]).unwrap(), vec![Attribute::Value(certificate.clone())]);
+    drop(session);
+    let error = crate::identity_with_pkcs11(&selection).err().expect("certificate without key must not be an identity");
+    assert!(matches!(error, crate::Error::IdentityUnavailable { .. }));
+    assert!(!error.to_string().contains(pin.trim()));
+    fs::write(fixture.join("missing-private-key.json"), serde_json::to_vec_pretty(&serde_json::json!({
+        "status":"PASS","certificate_preserved":true,"private_keys_before":1,"private_keys_after":0,
+        "certificate_sha256":Sha256::digest(&certificate).iter().map(|byte|format!("{byte:02x}")).collect::<String>(),"positive_real_token_signature":true,
+        "fresh_identity_unavailable":true,"task_soft_token_only":true,"pin_modified":false,"private_key_exported":false
+    })).unwrap()).unwrap();
 }

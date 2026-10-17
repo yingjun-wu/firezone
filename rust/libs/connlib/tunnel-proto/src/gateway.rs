@@ -75,6 +75,15 @@ impl DnsResourceNatEntry {
 }
 
 impl GatewayState {
+    pub fn poll_connection_observation(
+        &mut self,
+    ) -> Option<snownet::ConnectionObservation<ClientId>> {
+        self.node.poll_connection_observation()
+    }
+    pub fn dropped_connection_observations(&self) -> u64 {
+        self.node.dropped_connection_observations()
+    }
+
     pub fn new(seed: [u8; 32], now: Instant, unix_ts: Duration) -> Self {
         Self {
             peers: Default::default(),

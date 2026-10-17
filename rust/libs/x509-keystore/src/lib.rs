@@ -48,6 +48,33 @@ pub fn identity() -> Result<Option<Identity>, Error> {
     keystore::identity(x509_claims::DEVICE_CERTIFICATE_COMMON_NAME)
 }
 
+/// Explicit Linux PKCS#11 selection. Only a private file path is configured;
+/// PIN values never appear in serialized configuration or process arguments.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Pkcs11Selection {
+    pub module: std::path::PathBuf,
+    pub pin_file: std::path::PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_serial: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_id: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_cn: Option<String>,
+}
+
+/// Loads an explicitly configured identity. Missing/ambiguous certificates,
+/// unsafe PIN files and token failures are errors, never anonymous identities.
+/// The legacy platform discovery API and its root-owned PIN path are unchanged.
+#[cfg(target_os = "linux")]
+pub fn identity_with_pkcs11(selection: &Pkcs11Selection) -> Result<Identity, Error> {
+    linux::identity_with_selection(selection)
+}
+
 /// A client identity a keystore backend selected.
 pub struct Identity {
     /// The end-entity certificate first, then as many issuers as the keystore could resolve.
